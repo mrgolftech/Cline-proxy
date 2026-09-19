@@ -365,7 +365,6 @@ func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any
 		})
 		return
 	}
-	model, _ := params["model"].(string)
 	zm, ok := resolveZenFreeModel(model)
 	if !ok {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
@@ -543,7 +542,12 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			continue
 		}
 
-		nodes := effectiveNodes(acc, model)
+		nodes, nodeErr := effectiveNodes(acc)
+		if nodeErr != nil {
+			lastErr = nodeErr
+			log.Printf("  failover %d/%d: %v", attempt, attempts, nodeErr)
+			continue
+		}
 		log.Printf("  upstream: account=%s attempt=%d/%d stream=%v tools=%d msgs=%d max_tokens=%v effort=%v nodes=%d",
 			truncateEmail(acc.Email), attempt, attempts, stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"], len(nodes))
 
@@ -561,7 +565,10 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 }
 
 // clineNodeRetries 每个出口节点的额外重试次数（总尝试 = 1 + clineNodeRetries）。
-const clineNodeRetries = 2
+const (
+	clineNodeRetries    = 1
+	maxClineNodeAttempts = 4
+)
 
 // tryAccountOverNodes 依次尝试该账号的各出口节点，每节点最多 1+clineNodeRetries 次尝试：
 //   - 网络错误 / 5xx → 同节点重试；用尽后切下一节点
@@ -572,8 +579,17 @@ const clineNodeRetries = 2
 func tryAccountOverNodes(acc *Account, token, sessionID string, bodyJSON []byte, nodes []string) (*http.Response, error) {
 	refreshed := false
 	var lastNodeErr error
+	attemptBudget := 0
 
 	for _, nodeURL := range nodes {
+		if attemptBudget >= maxClineNodeAttempts {
+			break
+		}
+		if nodeURL != "" && !proxyNodeAvailable(nodeURL) {
+			lastNodeErr = fmt.Errorf("node %s is in cooldown", maskProxyURL(nodeURL))
+			continue
+		}
+
 		label := maskProxyURL(nodeURL)
 		if nodeURL == "" {
 			label = "direct"
@@ -581,7 +597,8 @@ func tryAccountOverNodes(acc *Account, token, sessionID string, bodyJSON []byte,
 		var nodeErr error
 
 	tryLoop:
-		for try := 0; try <= clineNodeRetries; try++ {
+		for try := 0; try <= clineNodeRetries && attemptBudget < maxClineNodeAttempts; try++ {
+			attemptBudget++
 			req, reqErr := newClineRequest(token, sessionID, bodyJSON)
 			if reqErr != nil {
 				return nil, reqErr
@@ -589,13 +606,15 @@ func tryAccountOverNodes(acc *Account, token, sessionID string, bodyJSON []byte,
 			resp, doErr := clineClientFor(nodeURL).Do(req)
 			if doErr != nil {
 				nodeErr = doErr
-				if try < clineNodeRetries {
+				recordProxyNodeFailure(nodeURL, doErr.Error())
+				if try < clineNodeRetries && attemptBudget < maxClineNodeAttempts {
 					time.Sleep(time.Duration(300*(try+1)) * time.Millisecond)
 				}
 				continue
 			}
 
 			if resp.StatusCode == http.StatusOK {
+				recordProxyNodeSuccess(nodeURL)
 				bumpUsage(acc)
 				return resp, nil
 			}
@@ -611,7 +630,7 @@ func tryAccountOverNodes(acc *Account, token, sessionID string, bodyJSON []byte,
 				}
 				token = acc.AccessToken
 				refreshed = true
-				continue // 同节点用新 token 重试
+				continue
 			}
 
 			bodyBytes, _ := io.ReadAll(resp.Body)
@@ -631,14 +650,15 @@ func tryAccountOverNodes(acc *Account, token, sessionID string, bodyJSON []byte,
 			case http.StatusForbidden:
 				if strings.Contains(strings.ToLower(reason), "region") {
 					nodeErr = fmt.Errorf("node %s region blocked", label)
-					log.Printf("  node %s region blocked; next node", label)
+					log.Printf("  node %s region blocked; next bound node", label)
 					break tryLoop
 				}
 				return nil, fmt.Errorf("API 403: %s", reason)
 
 			case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 				nodeErr = fmt.Errorf("upstream %d via %s: %s", resp.StatusCode, label, reason)
-				continue // 同节点重试
+				recordProxyNodeFailure(nodeURL, nodeErr.Error())
+				continue
 
 			default:
 				return nil, fmt.Errorf("API %d: %s", resp.StatusCode, reason)
@@ -652,7 +672,7 @@ func tryAccountOverNodes(acc *Account, token, sessionID string, bodyJSON []byte,
 	}
 
 	if lastNodeErr == nil {
-		lastNodeErr = fmt.Errorf("no node produced a response")
+		lastNodeErr = fmt.Errorf("no bound node produced a response")
 	}
 	return nil, fmt.Errorf("account %s: %w", acc.Email, lastNodeErr)
 }
