@@ -21,7 +21,7 @@ type RequestLog struct {
 	Method   string    `json:"method"`
 	Path     string    `json:"path"`
 	Model    string    `json:"model,omitempty"`
-	Route    string    `json:"route"` // zen | cline | admin | other
+	Route    string    `json:"route"` // cline | admin | other
 	Status   int       `json:"status"`
 	Duration int64     `json:"duration_ms"`
 	Note     string    `json:"note,omitempty"`
@@ -160,8 +160,6 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/admin"):
 			route = "admin"
-		case strings.HasPrefix(model, "zen/"):
-			route = "zen"
 		case model != "":
 			route = "cline"
 		case strings.Contains(r.URL.Path, "models") || strings.Contains(r.URL.Path, "health"):

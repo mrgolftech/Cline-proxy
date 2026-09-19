@@ -462,29 +462,10 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
       <div class="field"><label>URL</label><input type="text" id="pnUrl" placeholder="http://user:pass@host:port 或 socks5://host:port"></div>
       <div class="field" style="justify-content:flex-end"><button class="btn btn-primary" onclick="addProxyNode()">➕ 添加</button></div>
     </div>
-    <div class="hint">同名节点会覆盖其 URL。账号与模型规则按「名称」引用节点。</div>
+    <div class="hint">同名节点会覆盖其 URL。出口由账号绑定关系唯一决定；未绑定代理的账号才允许直连。已绑定节点失效时请求会失败并切换账号，不会静默直连。</div>
   </div>
 </div>
 
-<div class="section">
-  <div class="section-title">模型出口规则</div>
-  <div class="section-body">
-    <div class="table-wrap">
-    <table>
-      <thead><tr><th style="width:280px">模型</th><th>允许的出口（逗号分隔名称，按序尝试）</th><th style="width:90px">操作</th></tr></thead>
-      <tbody id="modelProxyBody"></tbody>
-    </table>
-    </div>
-    <div class="form-row" style="margin-top:12px">
-      <div class="field"><label>模型</label><input type="text" id="mpModel" placeholder="cline-free/muse-spark-1.3-contributor"></div>
-      <div class="field"><label>出口节点（多选，顺序=尝试顺序）</label>
-        <div class="ms" id="mpNodesMs" data-ms data-value=""><button type="button" class="ms-btn" onclick="msToggle(event,this)"></button><div class="ms-panel" onclick="event.stopPropagation()"></div></div>
-      </div>
-      <div class="field" style="justify-content:flex-end"><button class="btn btn-primary" onclick="saveModelProxy()">💾 保存规则</button></div>
-    </div>
-    <div class="hint">为某模型限定出口后，只有列出的节点会被使用；账号未绑定这些节点时，直接使用规则里的节点。</div>
-  </div>
-</div>
 </div>
 
 
@@ -691,7 +672,6 @@ async function loadProxyPool() {
     const d = await api('GET', '/config');
     const proxies = (d.data && d.data.proxies) || [];
     POOL_NODES = proxies;
-    const mp = (d.data && d.data.modelProxies) || {};
     const tb = _('proxyPoolBody');
     if (!tb) return;
     tb.innerHTML = proxies.length ? proxies.map(p =>
@@ -700,15 +680,6 @@ async function loadProxyPool() {
       '<td style="white-space:nowrap"><button class="btn btn-sm" onclick="testProxyNode(\'' + esc(p.name) + '\', this)" title="测试连通性（返回出口 IP/地区）">⚡ 测试</button> ' +
       '<button class="btn btn-sm btn-danger" onclick="deleteProxyNode(\'' + esc(p.name) + '\')" title="删除">✕</button></td></tr>'
     ).join('') : '<tr><td colspan="3" class="empty">暂无节点，请在下方添加</td></tr>';
-
-    const mb = _('modelProxyBody');
-    const keys = Object.keys(mp);
-    mb.innerHTML = keys.length ? keys.map(k =>
-      '<tr><td class="mono" style="font-size:11px">' + esc(k) + '</td>' +
-      '<td>' + esc((mp[k] || []).join(', ')) + '</td>' +
-      '<td><button class="btn btn-sm" onclick="editModelProxy(\'' + esc(k) + '\')" title="编辑">✏️</button> ' +
-      '<button class="btn btn-sm btn-danger" onclick="deleteModelProxy(\'' + esc(k) + '\')" title="删除">✕</button></td></tr>'
-    ).join('') : '<tr><td colspan="3" class="empty">暂无规则（所有模型可用账号绑定的任意出口）</td></tr>';
   } catch (e) { toast('加载代理池失败: ' + e.message, 'error'); }
 }
 
@@ -726,7 +697,7 @@ async function addProxyNode() {
 }
 
 async function deleteProxyNode(name) {
-  if (!confirm('删除节点 ' + name + ' ？引用它的账号/规则将失效。')) return;
+  if (!confirm('删除节点 ' + name + ' ？仍绑定该节点的账号会进入 fail-closed 状态，直到重新绑定可用节点。')) return;
   try { await api('POST', '/proxies/delete', { name }); toast('已删除', 'success'); POOL_NODES = []; loadProxyPool(); }
   catch (e) { toast('删除失败: ' + e.message, 'error'); }
 }
@@ -741,29 +712,6 @@ async function testProxyNode(name, btn) {
     else toast('节点 ' + name + ' 不可用\n' + (r.error || ('HTTP ' + (r.httpStatus || '?'))), 'error', 7000);
   } catch (e) { toast('测试失败: ' + e.message, 'error'); }
   finally { if (btn) { btn.disabled = false; btn.innerHTML = orig; } }
-}
-
-async function saveModelProxy() {
-  const model = _('mpModel').value.trim();
-  const nodes = msValue(_('mpNodesMs'));
-  if (!model) { toast('模型必填', 'error'); return; }
-  try { await api('POST', '/model-proxies', { model, nodes }); toast('规则已保存', 'success'); _('mpModel').value = ''; msSetValue(_('mpNodesMs'), []); loadProxyPool(); }
-  catch (e) { toast('保存失败: ' + e.message, 'error'); }
-}
-
-async function editModelProxy(k) {
-  _('mpModel').value = k;
-  await ensurePoolNodes();
-  try {
-    const d = await api('GET', '/config');
-    msSetValue(_('mpNodesMs'), (((d.data || {}).modelProxies || {})[k] || []));
-  } catch (e) { /* ignore */ }
-}
-
-async function deleteModelProxy(k) {
-  if (!confirm('删除模型规则 ' + k + ' ？')) return;
-  try { await api('POST', '/model-proxies', { model: k, nodes: [] }); toast('已删除', 'success'); loadProxyPool(); }
-  catch (e) { toast('删除失败: ' + e.message, 'error'); }
 }
 
 async function saveAccountProxies(id, btn) {
@@ -796,6 +744,7 @@ async function testAccount(id, btn) {
     if (r.remaining) msg += '（剩余 ' + esc(r.remaining) + '）';
     if (r.reason) msg += '\n原因: ' + esc(r.reason);
     if (r.httpStatus) msg += '\nHTTP: ' + r.httpStatus;
+    if (r.nodes && r.nodes.length) msg += '\n出口: ' + r.nodes.join(' → ');
     const type = r.status === 'active' ? 'success' : (r.status === 'cooldown' ? 'warning' : 'error');
     toast(msg, type, 6000);
     loadAccounts(); loadStats();
@@ -1001,7 +950,7 @@ function copyText(t) {
 }
 
 // ========== 请求日志 ==========
-const ROUTE_LABEL = { zen: 'opencode', cline: 'cline 池', admin: '管理', meta: '元信息', other: '其他' };
+const ROUTE_LABEL = { cline: 'cline 池', admin: '管理', meta: '元信息', other: '其他' };
 const STATUS_CLASS = s => s >= 500 ? 'color:var(--danger)' : (s >= 400 ? 'color:var(--amber)' : 'color:var(--accent2)');
 
 async function loadLogs() {

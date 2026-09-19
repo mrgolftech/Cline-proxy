@@ -518,50 +518,6 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 
 	chat := responsesToChat(params)
 	chatModel, _ := chat["model"].(string)
-	route := routeModel(chatModel)
-	if route == "reject" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", chatModel), "type": "invalid_request_error"},
-		})
-		return
-	}
-	if route == "zen" {
-		zm, ok := resolveZenFreeModel(chatModel)
-		if !ok {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": map[string]string{"message": fmt.Sprintf("model %q is not a free zen model", chatModel), "type": "invalid_request_error"},
-			})
-			return
-		}
-		sid := requestSessionID(chat, r.Header)
-		out := maybeCompact(chat, zm, sid)
-		if out.changed {
-			log.Printf("  responses zen: %s", out.note)
-		}
-		resp, _, err := callZenAPI(chat, isStream)
-		if err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]any{
-				"error": map[string]string{"message": err.Error(), "type": "api_error"},
-			})
-			return
-		}
-		defer resp.Body.Close()
-		if isStream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-					w.WriteHeader(http.StatusOK)
-			chatStreamToResponses(w, resp, nil)
-			return
-		}
-		var raw map[string]any
-		if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
-			return
-		}
-		writeJSON(w, http.StatusOK, chatToResponses(raw))
-		return
-	}
 
 	// cline 上游
 	stream := isStream

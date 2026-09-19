@@ -218,3 +218,173 @@ func TestStatusWriterPreservesFlusher(t *testing.T) {
 		t.Fatalf("expected status 200 after flush, got %d", sw.status)
 	}
 }
+
+func TestEffectiveNodesUnboundAllowsDirect(t *testing.T) {
+	old := proxyConfig
+	proxyConfigMu.Lock()
+	proxyConfig = &proxyConfigData{Strategy: "round_robin", Headers: map[string]string{}, Proxies: []ProxyNode{}}
+	proxyConfigMu.Unlock()
+	t.Cleanup(func() {
+		proxyConfigMu.Lock()
+		proxyConfig = old
+		proxyConfigMu.Unlock()
+	})
+
+	nodes, err := effectiveNodes(&Account{AccountID: "a", Email: "a@example.test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(nodes) != 1 || nodes[0] != "" {
+		t.Fatalf("unbound account should use direct only, got %#v", nodes)
+	}
+}
+
+func TestEffectiveNodesMissingBindingFailsClosed(t *testing.T) {
+	old := proxyConfig
+	proxyConfigMu.Lock()
+	proxyConfig = &proxyConfigData{Strategy: "round_robin", Headers: map[string]string{}, Proxies: []ProxyNode{}}
+	proxyConfigMu.Unlock()
+	t.Cleanup(func() {
+		proxyConfigMu.Lock()
+		proxyConfig = old
+		proxyConfigMu.Unlock()
+	})
+
+	nodes, err := effectiveNodes(&Account{
+		AccountID: "a", Email: "a@example.test", Proxies: []string{"missing-node"},
+	})
+	if err == nil {
+		t.Fatalf("expected fail-closed error, got nodes %#v", nodes)
+	}
+	if len(nodes) != 0 {
+		t.Fatalf("bound account must never fall back to direct, got %#v", nodes)
+	}
+}
+
+func TestEffectiveNodesPreservesAccountOrder(t *testing.T) {
+	old := proxyConfig
+	proxyConfigMu.Lock()
+	proxyConfig = &proxyConfigData{
+		Strategy: "round_robin",
+		Headers: map[string]string{},
+		Proxies: []ProxyNode{
+			{Name: "a", URL: "http://127.0.0.1:18081"},
+			{Name: "b", URL: "http://127.0.0.1:18082"},
+		},
+	}
+	proxyConfigMu.Unlock()
+	t.Cleanup(func() {
+		proxyConfigMu.Lock()
+		proxyConfig = old
+		proxyConfigMu.Unlock()
+		clearProxyNodeHealth("http://127.0.0.1:18081")
+		clearProxyNodeHealth("http://127.0.0.1:18082")
+	})
+
+	nodes, err := effectiveNodes(&Account{
+		AccountID: "a", Email: "a@example.test", Proxies: []string{"b", "a"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"http://127.0.0.1:18082", "http://127.0.0.1:18081"}
+	if len(nodes) != len(want) || nodes[0] != want[0] || nodes[1] != want[1] {
+		t.Fatalf("expected ordered account exits %#v, got %#v", want, nodes)
+	}
+}
+
+func TestProxyNodeCircuitBreaker(t *testing.T) {
+	const node = "http://127.0.0.1:19090"
+	clearProxyNodeHealth(node)
+	t.Cleanup(func() { clearProxyNodeHealth(node) })
+
+	recordProxyNodeFailure(node, "first")
+	if !proxyNodeAvailable(node) {
+		t.Fatal("node should remain available after first failure")
+	}
+	recordProxyNodeFailure(node, "second")
+	if proxyNodeAvailable(node) {
+		t.Fatal("node should enter cooldown after threshold")
+	}
+	if proxyNodeCooldownRemaining(node) <= 0 {
+		t.Fatal("expected positive cooldown")
+	}
+	recordProxyNodeSuccess(node)
+	if !proxyNodeAvailable(node) {
+		t.Fatal("successful probe should clear circuit breaker")
+	}
+}
+
+func TestGetProxyConfigReturnsSnapshot(t *testing.T) {
+	old := proxyConfig
+	proxyConfigMu.Lock()
+	proxyConfig = &proxyConfigData{
+		Strategy: "fill",
+		Headers: map[string]string{"X-Test": "original"},
+		Proxies: []ProxyNode{{Name: "a", URL: "http://127.0.0.1:18081"}},
+	}
+	proxyConfigMu.Unlock()
+	t.Cleanup(func() {
+		proxyConfigMu.Lock()
+		proxyConfig = old
+		proxyConfigMu.Unlock()
+	})
+
+	snapshot := getProxyConfig()
+	snapshot.Headers["X-Test"] = "mutated"
+	snapshot.Proxies[0].URL = "http://127.0.0.1:9999"
+
+	again := getProxyConfig()
+	if again.Headers["X-Test"] != "original" {
+		t.Fatalf("header mutation leaked into global config: %#v", again.Headers)
+	}
+	if again.Proxies[0].URL != "http://127.0.0.1:18081" {
+		t.Fatalf("proxy mutation leaked into global config: %#v", again.Proxies)
+	}
+}
+
+func TestCallClineAPIMissingBoundNodeNeverDialsDirect(t *testing.T) {
+	oldBase := clineAPIBaseURL
+	oldPoolPath := poolPath
+	oldPool := pool
+	oldConfig := proxyConfig
+	t.Cleanup(func() {
+		clineAPIBaseURL = oldBase
+		poolPath = oldPoolPath
+		pool = oldPool
+		proxyConfigMu.Lock()
+		proxyConfig = oldConfig
+		proxyConfigMu.Unlock()
+	})
+
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	clineAPIBaseURL = server.URL
+
+	poolPath = filepath.Join(t.TempDir(), "pool.json")
+	pool = &AccountPool{Accounts: []*Account{
+		{
+			AccountID: "a", Email: "a@example.test", AccessToken: "workos:first",
+			ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), Status: "active",
+			Proxies: []string{"deleted-node"},
+		},
+	}}
+	proxyConfigMu.Lock()
+	proxyConfig = &proxyConfigData{Strategy: "fill", Headers: map[string]string{}, Proxies: []ProxyNode{}}
+	proxyConfigMu.Unlock()
+
+	_, _, err := callClineAPI(map[string]any{
+		"model": "test",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}, false)
+	if err == nil {
+		t.Fatal("expected fail-closed error")
+	}
+	if hits != 0 {
+		t.Fatalf("bound account unexpectedly dialed direct upstream %d time(s)", hits)
+	}
+}
