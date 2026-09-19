@@ -19,7 +19,8 @@ type Account struct {
 	CreatedAt     time.Time `json:"createdAt"`
 	CooldownUntil time.Time `json:"cooldownUntil,omitempty"` // 预计冷却结束时间
 	LastReason    string    `json:"lastReason,omitempty"`    // 最后一次进入冷却/失效的原因
-	Proxy         string    `json:"proxy,omitempty"`         // 绑定的出口代理 http(s):// 或 socks5://，空=直连
+	Proxy         string    `json:"proxy,omitempty"`         // (legacy) 单个出口代理 URL，空=直连
+	Proxies       []string  `json:"proxies,omitempty"`       // 绑定的代理池节点名称，按序尝试（空=直连）
 }
 
 type AccountPool struct {

@@ -272,13 +272,24 @@ func markAccountCooldown(acc *Account, reason string, duration time.Duration) {
 	poolMu.Unlock()
 }
 
-// setAccountProxy 设置账号绑定的出口代理（空=直连），并落盘。
+// setAccountProxy 设置账号绑定的单个出口代理 URL（空=直连），并落盘。
 func setAccountProxy(acc *Account, proxy string) {
 	if acc == nil {
 		return
 	}
 	poolMu.Lock()
 	acc.Proxy = proxy
+	savePoolLocked()
+	poolMu.Unlock()
+}
+
+// setAccountProxies 设置账号绑定的出口节点名称列表（有序，空=直连），并落盘。
+func setAccountProxies(acc *Account, names []string) {
+	if acc == nil {
+		return
+	}
+	poolMu.Lock()
+	acc.Proxies = names
 	savePoolLocked()
 	poolMu.Unlock()
 }

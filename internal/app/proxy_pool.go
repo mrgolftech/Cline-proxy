@@ -254,6 +254,66 @@ func clineClientFor(proxyURL string) *http.Client {
 	return c
 }
 
+// poolNodeByName 按名称查代理池节点。
+func poolNodeByName(name string) (ProxyNode, bool) {
+	cfg := getProxyConfig()
+	for _, n := range cfg.Proxies {
+		if n.Name == name {
+			return n, true
+		}
+	}
+	return ProxyNode{}, false
+}
+
+// effectiveNodes 返回该账号在指定模型下应依次尝试的出口 URL 列表（有序）。
+// 账号绑定的节点名 + (legacy) 单 URL；若模型有出口规则则只允许规则内节点
+// （账号未命中规则内节点时，退回规则自身的节点）。空列表 => 返回 [""]（直连）。
+func effectiveNodes(acc *Account, model string) []string {
+	type ref struct{ name, url string }
+	var refs []ref
+	if acc != nil {
+		for _, nm := range acc.Proxies {
+			if n, ok := poolNodeByName(nm); ok {
+				refs = append(refs, ref{nm, n.URL})
+			}
+		}
+		if acc.Proxy != "" {
+			refs = append(refs, ref{"", acc.Proxy})
+		}
+	}
+
+	cfg := getProxyConfig()
+	if rule := cfg.ModelProxies[model]; len(rule) > 0 {
+		allowed := make(map[string]bool, len(rule))
+		for _, nm := range rule {
+			allowed[nm] = true
+		}
+		var filtered []ref
+		for _, r := range refs {
+			if allowed[r.name] {
+				filtered = append(filtered, r)
+			}
+		}
+		if len(filtered) == 0 {
+			for _, nm := range rule {
+				if n, ok := poolNodeByName(nm); ok {
+					filtered = append(filtered, ref{nm, n.URL})
+				}
+			}
+		}
+		refs = filtered
+	}
+
+	urls := make([]string, 0, len(refs))
+	for _, r := range refs {
+		urls = append(urls, r.url)
+	}
+	if len(urls) == 0 {
+		urls = []string{""}
+	}
+	return urls
+}
+
 // dialHTTPProxy 通过 http(s) 代理建立 CONNECT 隧道
 func dialHTTPProxy(ctx context.Context, u *url.URL, network, addr string) (net.Conn, error) {
 	d := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}

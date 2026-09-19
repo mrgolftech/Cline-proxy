@@ -524,6 +524,8 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
 	}
 
+	model, _ := params["model"].(string)
+
 	tried := make(map[string]struct{}, attempts)
 	var lastErr error
 
@@ -541,77 +543,118 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			continue
 		}
 
-		log.Printf("  upstream: account=%s attempt=%d/%d stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
-			truncateEmail(acc.Email), attempt, attempts, stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
+		nodes := effectiveNodes(acc, model)
+		log.Printf("  upstream: account=%s attempt=%d/%d stream=%v tools=%d msgs=%d max_tokens=%v effort=%v nodes=%d",
+			truncateEmail(acc.Email), attempt, attempts, stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"], len(nodes))
 
-		req, reqErr := newClineRequest(token, sessionID, bodyJSON)
-		if reqErr != nil {
-			return nil, acc, reqErr
-		}
-		resp, doErr := clineClientFor(acc.Proxy).Do(req)
-		if doErr != nil {
-			markAccountCooldown(acc, "network error: "+doErr.Error(), 5*time.Minute)
-			lastErr = fmt.Errorf("account %s network error: %w", acc.Email, doErr)
-			continue
-		}
-
-		if resp.StatusCode == http.StatusUnauthorized {
-			resp.Body.Close()
-			if refreshErr := refreshAccountToken(acc); refreshErr != nil {
-				lastErr = fmt.Errorf("account %s refresh failed: %w", acc.Email, refreshErr)
-				continue
-			}
-			// Rebuild the request so the JSON body is fresh after the first send.
-			req, reqErr = newClineRequest(acc.AccessToken, sessionID, bodyJSON)
-			if reqErr != nil {
-				return nil, acc, reqErr
-			}
-			resp, doErr = clineClientFor(acc.Proxy).Do(req)
-			if doErr != nil {
-				markAccountCooldown(acc, "network error after refresh: "+doErr.Error(), 5*time.Minute)
-				lastErr = fmt.Errorf("account %s retry failed: %w", acc.Email, doErr)
-				continue
-			}
-			if resp.StatusCode == http.StatusUnauthorized {
-				resp.Body.Close()
-				markAccountExpired(acc, "401 after token refresh")
-				lastErr = fmt.Errorf("account %s token expired permanently", acc.Email)
-				continue
-			}
-		}
-
-		if resp.StatusCode == http.StatusOK {
-			bumpUsage(acc)
+		resp, accErr := tryAccountOverNodes(acc, token, sessionID, bodyJSON, nodes)
+		if accErr == nil {
 			return resp, acc, nil
 		}
-
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		reason := kit.Truncate(string(bodyBytes), 500)
-
-		switch resp.StatusCode {
-		case http.StatusTooManyRequests:
-			duration := parseInferenceCapDuration(string(bodyBytes))
-			if duration <= 0 {
-				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
-			}
-			markAccountCooldown(acc, "429: "+reason, duration)
-			lastErr = fmt.Errorf("account %s rate limited: %s", acc.Email, reason)
-			log.Printf("  account %s cooldown %v; failing over", truncateEmail(acc.Email), duration)
-			continue
-		case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-			markAccountCooldown(acc, fmt.Sprintf("%d: %s", resp.StatusCode, reason), time.Minute)
-			lastErr = fmt.Errorf("account %s transient upstream %d: %s", acc.Email, resp.StatusCode, reason)
-			continue
-		default:
-			return nil, acc, fmt.Errorf("API %d: %s", resp.StatusCode, reason)
-		}
+		lastErr = accErr
 	}
 
 	if lastErr == nil {
 		lastErr = fmt.Errorf("no eligible account remained")
 	}
 	return nil, nil, fmt.Errorf("all candidate accounts failed after %d attempt(s): %w", len(tried), lastErr)
+}
+
+// clineNodeRetries 每个出口节点的额外重试次数（总尝试 = 1 + clineNodeRetries）。
+const clineNodeRetries = 2
+
+// tryAccountOverNodes 依次尝试该账号的各出口节点，每节点最多 1+clineNodeRetries 次尝试：
+//   - 网络错误 / 5xx → 同节点重试；用尽后切下一节点
+//   - 403 地区受限（如 muse 从非允许地区出口）→ 立即切下一节点
+//   - 429 / 401(刷新后仍失败) → 账号级失败，返回让上层换账号
+//
+// 成功返回 (resp, nil)；全部节点失败返回 (nil, err)。
+func tryAccountOverNodes(acc *Account, token, sessionID string, bodyJSON []byte, nodes []string) (*http.Response, error) {
+	refreshed := false
+	var lastNodeErr error
+
+	for _, nodeURL := range nodes {
+		label := maskProxyURL(nodeURL)
+		if nodeURL == "" {
+			label = "direct"
+		}
+		var nodeErr error
+
+	tryLoop:
+		for try := 0; try <= clineNodeRetries; try++ {
+			req, reqErr := newClineRequest(token, sessionID, bodyJSON)
+			if reqErr != nil {
+				return nil, reqErr
+			}
+			resp, doErr := clineClientFor(nodeURL).Do(req)
+			if doErr != nil {
+				nodeErr = doErr
+				if try < clineNodeRetries {
+					time.Sleep(time.Duration(300*(try+1)) * time.Millisecond)
+				}
+				continue
+			}
+
+			if resp.StatusCode == http.StatusOK {
+				bumpUsage(acc)
+				return resp, nil
+			}
+
+			if resp.StatusCode == http.StatusUnauthorized {
+				resp.Body.Close()
+				if refreshed {
+					markAccountExpired(acc, "401 after token refresh")
+					return nil, fmt.Errorf("account %s token expired permanently", acc.Email)
+				}
+				if rerr := refreshAccountToken(acc); rerr != nil {
+					return nil, fmt.Errorf("account %s refresh failed: %w", acc.Email, rerr)
+				}
+				token = acc.AccessToken
+				refreshed = true
+				continue // 同节点用新 token 重试
+			}
+
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			reason := kit.Truncate(string(bodyBytes), 500)
+
+			switch resp.StatusCode {
+			case http.StatusTooManyRequests:
+				duration := parseInferenceCapDuration(string(bodyBytes))
+				if duration <= 0 {
+					duration = parseRetryAfter(resp.Header.Get("Retry-After"))
+				}
+				markAccountCooldown(acc, "429: "+reason, duration)
+				log.Printf("  account %s cooldown %v; failing over", truncateEmail(acc.Email), duration)
+				return nil, fmt.Errorf("account %s rate limited: %s", acc.Email, reason)
+
+			case http.StatusForbidden:
+				if strings.Contains(strings.ToLower(reason), "region") {
+					nodeErr = fmt.Errorf("node %s region blocked", label)
+					log.Printf("  node %s region blocked; next node", label)
+					break tryLoop
+				}
+				return nil, fmt.Errorf("API 403: %s", reason)
+
+			case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+				nodeErr = fmt.Errorf("upstream %d via %s: %s", resp.StatusCode, label, reason)
+				continue // 同节点重试
+
+			default:
+				return nil, fmt.Errorf("API %d: %s", resp.StatusCode, reason)
+			}
+		}
+
+		if nodeErr != nil {
+			lastNodeErr = nodeErr
+			log.Printf("  node %s exhausted: %v", label, nodeErr)
+		}
+	}
+
+	if lastNodeErr == nil {
+		lastNodeErr = fmt.Errorf("no node produced a response")
+	}
+	return nil, fmt.Errorf("account %s: %w", acc.Email, lastNodeErr)
 }
 
 // accountUsageFn 构造账号 token 记账回调：从上游 usage 提取

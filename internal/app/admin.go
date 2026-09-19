@@ -53,6 +53,9 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/delete", corsHandler(handleAdminAccountDelete))
 	mux.HandleFunc("/admin/api/accounts/test", corsHandler(handleAdminAccountTest))
 	mux.HandleFunc("/admin/api/accounts/proxy", corsHandler(handleAdminAccountProxy))
+	mux.HandleFunc("/admin/api/proxies/add", corsHandler(handleAdminProxyAdd))
+	mux.HandleFunc("/admin/api/proxies/delete", corsHandler(handleAdminProxyDelete))
+	mux.HandleFunc("/admin/api/model-proxies", corsHandler(handleAdminModelProxies))
 	mux.HandleFunc("/admin/api/oauth/start", corsHandler(handleOAuthStart))
 	mux.HandleFunc("/admin/api/oauth/status", corsHandler(handleOAuthStatus))
 	mux.HandleFunc("/admin/api/sso/import", corsHandler(handleSSOImport))
@@ -627,8 +630,8 @@ func handleAdminAccountTest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// POST /admin/api/accounts/proxy  body: { accountId, proxy }
-// 绑定/解绑某账号的出口代理（空字符串=直连）。用于 muse 等地区受限模型 + 账号↔出口IP 绑定。
+// POST /admin/api/accounts/proxy  body: { accountId, proxies:[节点名], proxy?:"legacy url" }
+// 绑定/解绑某账号的出口节点（有序，空=直连）。用于 muse 等地区受限模型 + 账号↔出口IP 绑定。
 func handleAdminAccountProxy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
@@ -642,8 +645,9 @@ func handleAdminAccountProxy(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var req struct {
-		AccountID string `json:"accountId"`
-		Proxy     string `json:"proxy"`
+		AccountID string   `json:"accountId"`
+		Proxies   []string `json:"proxies"`
+		Proxy     *string  `json:"proxy"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
@@ -655,28 +659,202 @@ func handleAdminAccountProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	proxy := strings.TrimSpace(req.Proxy)
-	if proxy != "" {
-		u, perr := url.Parse(proxy)
-		if perr != nil || u.Host == "" {
-			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid proxy URL"})
-			return
+	if req.Proxies != nil {
+		names := []string{}
+		for _, n := range req.Proxies {
+			n = strings.TrimSpace(n)
+			if n == "" {
+				continue
+			}
+			if _, ok := poolNodeByName(n); !ok {
+				writeAPI(w, http.StatusBadRequest, apiResponse{Error: "unknown proxy node: " + n})
+				return
+			}
+			names = append(names, n)
 		}
-		switch u.Scheme {
-		case "http", "https", "socks5", "socks5h":
-		default:
-			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "proxy scheme must be http/https/socks5/socks5h"})
-			return
+		setAccountProxies(acc, names)
+	}
+	if req.Proxy != nil {
+		u := strings.TrimSpace(*req.Proxy)
+		if u != "" {
+			if err := validateProxyURL(u); err != nil {
+				writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+				return
+			}
 		}
+		setAccountProxy(acc, u)
 	}
 
-	setAccountProxy(acc, proxy)
-	log.Printf("Account %s proxy set to %q", truncateEmail(acc.Email), maskProxyURL(proxy))
+	log.Printf("Account %s proxies set to %v", truncateEmail(acc.Email), acc.Proxies)
 	writeAPI(w, http.StatusOK, apiResponse{
 		Success: true,
 		Message: "proxy updated",
-		Data:    map[string]any{"accountId": acc.AccountID, "proxy": acc.Proxy},
+		Data:    map[string]any{"accountId": acc.AccountID, "proxies": acc.Proxies, "proxy": acc.Proxy},
 	})
+}
+
+func validateProxyURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("invalid proxy URL")
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5", "socks5h":
+		return nil
+	}
+	return fmt.Errorf("proxy scheme must be http/https/socks5/socks5h")
+}
+
+// POST /admin/api/proxies/add  body: { name, url }
+func handleAdminProxyAdd(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	raw := strings.TrimSpace(req.URL)
+	if name == "" || raw == "" {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "name and url are required"})
+		return
+	}
+	if err := validateProxyURL(raw); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+
+	cfg := getProxyConfig()
+	replaced := false
+	for i := range cfg.Proxies {
+		if cfg.Proxies[i].Name == name {
+			cfg.Proxies[i].URL = raw
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		cfg.Proxies = append(cfg.Proxies, ProxyNode{Name: name, URL: raw})
+	}
+	setProxyConfig(cfg)
+	log.Printf("Proxy node %q %s (%s)", name, map[bool]string{true: "updated", false: "added"}[replaced], maskProxyURL(raw))
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "proxy added", Data: map[string]any{"proxies": cfg.Proxies}})
+}
+
+// POST /admin/api/proxies/delete  body: { name }
+func handleAdminProxyDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "name is required"})
+		return
+	}
+
+	cfg := getProxyConfig()
+	kept := cfg.Proxies[:0]
+	for _, p := range cfg.Proxies {
+		if p.Name != name {
+			kept = append(kept, p)
+		}
+	}
+	cfg.Proxies = kept
+	// 同步清理模型规则里的该节点
+	for m, nodes := range cfg.ModelProxies {
+		filtered := nodes[:0]
+		for _, n := range nodes {
+			if n != name {
+				filtered = append(filtered, n)
+			}
+		}
+		if len(filtered) == 0 {
+			delete(cfg.ModelProxies, m)
+		} else {
+			cfg.ModelProxies[m] = filtered
+		}
+	}
+	setProxyConfig(cfg)
+	log.Printf("Proxy node %q deleted", name)
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "proxy deleted", Data: map[string]any{"proxies": cfg.Proxies, "modelProxies": cfg.ModelProxies}})
+}
+
+// POST /admin/api/model-proxies  body: { model, nodes:[节点名] }  nodes 为空 => 删除该模型规则
+func handleAdminModelProxies(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		Model string   `json:"model"`
+		Nodes []string `json:"nodes"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
+		return
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "model is required"})
+		return
+	}
+
+	cfg := getProxyConfig()
+	names := []string{}
+	for _, n := range req.Nodes {
+		n = strings.TrimSpace(n)
+		if n == "" {
+			continue
+		}
+		if _, ok := poolNodeByName(n); !ok {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "unknown proxy node: " + n})
+			return
+		}
+		names = append(names, n)
+	}
+	if len(names) == 0 {
+		delete(cfg.ModelProxies, model)
+	} else {
+		cfg.ModelProxies[model] = names
+	}
+	setProxyConfig(cfg)
+	log.Printf("Model %q proxy rule set to %v", model, names)
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "rule saved", Data: map[string]any{"modelProxies": cfg.ModelProxies}})
 }
 
 // testAccount 对单个账号执行轻量探测请求，返回详细结果与最终状态。
@@ -868,6 +1046,12 @@ func loadProxyConfig() *proxyConfigData {
 	if cfg.Headers == nil {
 		cfg.Headers = defaultProxyConfig().Headers
 	}
+	if cfg.Proxies == nil {
+		cfg.Proxies = []ProxyNode{}
+	}
+	if cfg.ModelProxies == nil {
+		cfg.ModelProxies = map[string][]string{}
+	}
 	return cfg
 }
 
@@ -879,9 +1063,16 @@ func saveProxyConfigLocked() {
 	}
 }
 
+type ProxyNode struct {
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
 type proxyConfigData struct {
-	Strategy string            `json:"strategy"`
-	Headers  map[string]string `json:"headers"`
+	Strategy     string              `json:"strategy"`
+	Headers      map[string]string   `json:"headers"`
+	Proxies      []ProxyNode         `json:"proxies"`      // 全局代理池
+	ModelProxies map[string][]string `json:"modelProxies"` // 模型 -> 允许的节点名称（按序）
 }
 
 func defaultProxyConfig() *proxyConfigData {
@@ -898,6 +1089,8 @@ func defaultProxyConfig() *proxyConfigData {
 			"X-PLATFORM-VERSION": "4.1.19",
 			"X-CORE-VERSION":     "0.0.83",
 		},
+		Proxies:      []ProxyNode{},
+		ModelProxies: map[string][]string{},
 	}
 }
 
@@ -981,6 +1174,8 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		"poolPath":     poolPath,
 		"defaultModel": getDefaultModel(),
 		"headers":      cfg.Headers,
+		"proxies":      cfg.Proxies,
+		"modelProxies": cfg.ModelProxies,
 	}})
 }
 

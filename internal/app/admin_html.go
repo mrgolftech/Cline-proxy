@@ -196,6 +196,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 <h1><span class="logo">⚡</span><span class="brand-name">Cline 代理</span><button class="theme-toggle" onclick="toggleTheme()" title="切换主题"><span class="icon" id="themeIcon">🌙</span><span class="light-label">浅色</span><span class="dark-label">深色</span></button></h1>
 <div class="nav-item active" data-tab="dashboard"><span class="nav-ico">📊</span> 仪表盘</div>
 <div class="nav-item" data-tab="accounts"><span class="nav-ico">👤</span> 账号管理</div>
+<div class="nav-item" data-tab="proxies"><span class="nav-ico">🔌</span> 代理池</div>
 <div class="nav-item" data-tab="import"><span class="nav-ico">📥</span> 导入账号</div>
 <div class="nav-item" data-tab="settings"><span class="nav-ico">⚙️</span> 设置</div>
 <div class="nav-item" data-tab="logs"><span class="nav-ico">📜</span> 请求日志</div>
@@ -430,6 +431,49 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
 </div>
 </div>
 
+<div id="tab-proxies" class="tab-panel" style="display:none">
+<div class="flex justify-between" style="margin-bottom:16px">
+  <h2>🔌 代理池</h2>
+  <button class="btn btn-sm" onclick="loadProxyPool()">🔄 刷新</button>
+</div>
+
+<div class="section">
+  <div class="section-title">出口节点</div>
+  <div class="section-body">
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th style="width:200px">名称</th><th>URL</th><th style="width:60px">操作</th></tr></thead>
+      <tbody id="proxyPoolBody"><tr><td colspan="3" class="empty">加载中...</td></tr></tbody>
+    </table>
+    </div>
+    <div class="form-row" style="margin-top:12px">
+      <div class="field"><label>名称</label><input type="text" id="pnName" placeholder="如 UK-42015"></div>
+      <div class="field"><label>URL</label><input type="text" id="pnUrl" placeholder="http://user:pass@host:port 或 socks5://host:port"></div>
+      <div class="field" style="justify-content:flex-end"><button class="btn btn-primary" onclick="addProxyNode()">➕ 添加</button></div>
+    </div>
+    <div class="hint">同名节点会覆盖其 URL。账号与模型规则按「名称」引用节点。</div>
+  </div>
+</div>
+
+<div class="section">
+  <div class="section-title">模型出口规则</div>
+  <div class="section-body">
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th style="width:280px">模型</th><th>允许的出口（逗号分隔名称，按序尝试）</th><th style="width:90px">操作</th></tr></thead>
+      <tbody id="modelProxyBody"></tbody>
+    </table>
+    </div>
+    <div class="form-row" style="margin-top:12px">
+      <div class="field"><label>模型</label><input type="text" id="mpModel" placeholder="cline-free/muse-spark-1.3-contributor"></div>
+      <div class="field"><label>出口名称</label><input type="text" id="mpNodes" placeholder="UK-42015,DE-42022"></div>
+      <div class="field" style="justify-content:flex-end"><button class="btn btn-primary" onclick="saveModelProxy()">💾 保存规则</button></div>
+    </div>
+    <div class="hint">为某模型限定出口后，只有列出的节点会被使用；账号未绑定这些节点时，直接使用规则里的节点。</div>
+  </div>
+</div>
+</div>
+
 
 </div>
 </div>
@@ -492,6 +536,7 @@ document.querySelectorAll('.nav-item').forEach(el => {
     _('tab-' + el.dataset.tab).style.display = 'block';
     if (el.dataset.tab === 'dashboard') { loadStats(); loadAccounts(); }
     if (el.dataset.tab === 'accounts') loadAccounts();
+    if (el.dataset.tab === 'proxies') loadProxyPool();
     if (el.dataset.tab === 'settings') { loadKeys(); loadModels(); loadConfig(); }
     if (el.dataset.tab === 'logs') loadLogs();
   });
@@ -505,6 +550,7 @@ function switchTab(name) {
   _('tab-' + name).style.display = 'block';
   if (name === 'dashboard') { loadStats(); loadAccounts(); }
   if (name === 'accounts') loadAccounts();
+  if (name === 'proxies') loadProxyPool();
   if (name === 'settings') { loadKeys(); loadModels(); }
   if (name === 'logs') loadLogs();
 }
@@ -567,7 +613,7 @@ async function loadAccounts() {
         '<td>' + esc(a.email) + '</td>' +
         '<td><span class="status ' + a.status + '"><span class="status-dot ' + a.status + '"></span>' + (sn[a.status] || a.status) + '</span>' + statusExtra + '</td>' +
           '<td title="今日 ' + fmtNum(a.tokensToday) + ' / 累计 ' + fmtNum(a.tokensTotal) + ' tokens（上游返回 usage 时精确，否则为估算值）">' + fmtTokens(a.tokensToday) + ' / ' + fmtTokens(a.tokensTotal) + '</td>' +
-        '<td style="white-space:nowrap"><input class="acct-proxy" data-id="' + a.accountId + '" value="' + esc(a.proxy || '') + '" placeholder="http://user:pass@host:port" style="width:170px;font-size:11px;padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text)"> <button class="btn btn-sm" onclick="setAccountProxy(\'' + a.accountId + '\', this)" title="保存出口代理（空=直连）">💾</button></td>' +
+        '<td style="white-space:nowrap"><input class="acct-proxy" data-id="' + a.accountId + '" value="' + esc((a.proxies || []).join(', ')) + '" placeholder="节点名,逗号分隔" style="width:170px;font-size:11px;padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text)"> <button class="btn btn-sm" onclick="setAccountProxy(\'' + a.accountId + '\', this)" title="保存出口节点（有序，空=直连）">💾</button></td>' +
         '<td class="mono" style="font-size:11px">' + lu + '</td>' +
         '<td class="mono" style="font-size:11px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
@@ -579,13 +625,78 @@ async function loadAccounts() {
   } catch (e) { toast('加载账号失败: ' + e.message, 'error'); }
 }
 
+// ========== 代理池 ==========
+async function loadProxyPool() {
+  try {
+    const d = await api('GET', '/config');
+    const proxies = (d.data && d.data.proxies) || [];
+    const mp = (d.data && d.data.modelProxies) || {};
+    const tb = _('proxyPoolBody');
+    if (!tb) return;
+    tb.innerHTML = proxies.length ? proxies.map(p =>
+      '<tr><td>' + esc(p.name) + '</td>' +
+      '<td class="mono" style="font-size:11px">' + esc(p.url) + '</td>' +
+      '<td><button class="btn btn-sm btn-danger" onclick="deleteProxyNode(\'' + esc(p.name) + '\')" title="删除">✕</button></td></tr>'
+    ).join('') : '<tr><td colspan="3" class="empty">暂无节点，请在下方添加</td></tr>';
+
+    const mb = _('modelProxyBody');
+    const keys = Object.keys(mp);
+    mb.innerHTML = keys.length ? keys.map(k =>
+      '<tr><td class="mono" style="font-size:11px">' + esc(k) + '</td>' +
+      '<td>' + esc((mp[k] || []).join(', ')) + '</td>' +
+      '<td><button class="btn btn-sm" onclick="editModelProxy(\'' + esc(k) + '\')" title="编辑">✏️</button> ' +
+      '<button class="btn btn-sm btn-danger" onclick="deleteModelProxy(\'' + esc(k) + '\')" title="删除">✕</button></td></tr>'
+    ).join('') : '<tr><td colspan="3" class="empty">暂无规则（所有模型可用账号绑定的任意出口）</td></tr>';
+  } catch (e) { toast('加载代理池失败: ' + e.message, 'error'); }
+}
+
+async function addProxyNode() {
+  const name = _('pnName').value.trim();
+  const url = _('pnUrl').value.trim();
+  if (!name || !url) { toast('名称和 URL 必填', 'error'); return; }
+  try {
+    await api('POST', '/proxies/add', { name, url });
+    toast('节点已保存', 'success');
+    _('pnName').value = ''; _('pnUrl').value = '';
+    loadProxyPool();
+  } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
+async function deleteProxyNode(name) {
+  if (!confirm('删除节点 ' + name + ' ？引用它的账号/规则将失效。')) return;
+  try { await api('POST', '/proxies/delete', { name }); toast('已删除', 'success'); loadProxyPool(); }
+  catch (e) { toast('删除失败: ' + e.message, 'error'); }
+}
+
+async function saveModelProxy() {
+  const model = _('mpModel').value.trim();
+  const nodes = _('mpNodes').value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!model) { toast('模型必填', 'error'); return; }
+  try { await api('POST', '/model-proxies', { model, nodes }); toast('规则已保存', 'success'); _('mpModel').value = ''; _('mpNodes').value = ''; loadProxyPool(); }
+  catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
+async function editModelProxy(k) {
+  _('mpModel').value = k;
+  try {
+    const d = await api('GET', '/config');
+    _('mpNodes').value = (((d.data || {}).modelProxies || {})[k] || []).join(', ');
+  } catch (e) { /* ignore */ }
+}
+
+async function deleteModelProxy(k) {
+  if (!confirm('删除模型规则 ' + k + ' ？')) return;
+  try { await api('POST', '/model-proxies', { model: k, nodes: [] }); toast('已删除', 'success'); loadProxyPool(); }
+  catch (e) { toast('删除失败: ' + e.message, 'error'); }
+}
+
 async function setAccountProxy(id, btn) {
   const input = document.querySelector('input.acct-proxy[data-id="' + id + '"]');
-  const proxy = input ? input.value.trim() : '';
+  const proxies = input ? input.value.split(',').map(s => s.trim()).filter(Boolean) : [];
   if (btn) { btn.disabled = true; }
   try {
-    await api('POST', '/accounts/proxy', { accountId: id, proxy });
-    toast('出口代理已保存' + (proxy ? '' : '（已设为直连）'), 'success');
+    await api('POST', '/accounts/proxy', { accountId: id, proxies });
+    toast('出口节点已保存' + (proxies.length ? '' : '（已设为直连）'), 'success');
     loadAccounts();
   } catch (e) {
     toast('保存失败: ' + e.message, 'error');
