@@ -204,3 +204,17 @@ func TestCallClineAPIFailsOverOn429(t *testing.T) {
 		t.Fatalf("expected first account cooldown, got %s", pool.Accounts[0].Status)
 	}
 }
+
+func TestStatusWriterPreservesFlusher(t *testing.T) {
+	rr := httptest.NewRecorder()
+	sw := &statusWriter{ResponseWriter: rr}
+	var _ http.Flusher = sw
+
+	sw.Flush()
+	if !rr.Flushed {
+		t.Fatal("expected underlying ResponseWriter to be flushed")
+	}
+	if sw.status != http.StatusOK {
+		t.Fatalf("expected status 200 after flush, got %d", sw.status)
+	}
+}
