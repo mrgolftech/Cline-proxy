@@ -248,6 +248,7 @@ func ListAccounts() []*Account {
 			CooldownUntil:   a.CooldownUntil,
 			LastReason:     a.LastReason,
 			Proxy:           a.Proxy,
+			Proxies:         a.Proxies,
 		}
 	}
 	savePoolLocked()
