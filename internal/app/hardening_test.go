@@ -4,8 +4,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestAdminSecurityRemoteDeniedByDefault(t *testing.T) {
@@ -132,5 +134,56 @@ func TestNewClineRequestRebuildsBody(t *testing.T) {
 		if string(got) != string(body) {
 			t.Fatalf("attempt %d: body mismatch: %s", i, got)
 		}
+	}
+}
+
+func TestCallClineAPIFailsOverOn429(t *testing.T) {
+	oldBase := clineAPIBaseURL
+	oldPoolPath := poolPath
+	oldPool := pool
+	oldConfig := proxyConfig
+	t.Cleanup(func() {
+		clineAPIBaseURL = oldBase
+		poolPath = oldPoolPath
+		pool = oldPool
+		proxyConfig = oldConfig
+	})
+
+	poolPath = filepath.Join(t.TempDir(), "pool.json")
+	pool = &AccountPool{Accounts: []*Account{
+		{AccountID: "a", Email: "a@example.test", AccessToken: "workos:first", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), Status: "active"},
+		{AccountID: "b", Email: "b@example.test", AccessToken: "workos:second", ExpiresAt: time.Now().Add(time.Hour).UnixMilli(), Status: "active"},
+	}}
+	proxyConfig = &proxyConfigData{Strategy: "fill", Headers: map[string]string{}}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Header.Get("Authorization") {
+		case "Bearer workos:first":
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, `{"error":{"message":"rate limited"}}`, http.StatusTooManyRequests)
+		case "Bearer workos:second":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":"ok","model":"test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`))
+		default:
+			http.Error(w, "unexpected auth", http.StatusUnauthorized)
+		}
+	}))
+	defer server.Close()
+	clineAPIBaseURL = server.URL
+
+	resp, acc, err := callClineAPI(map[string]any{
+		"model": "test",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}, false)
+	if err != nil {
+		t.Fatalf("callClineAPI returned error: %v", err)
+	}
+	defer resp.Body.Close()
+	if acc == nil || acc.AccountID != "b" {
+		t.Fatalf("expected failover to account b, got %#v", acc)
+	}
+	if pool.Accounts[0].Status != "cooldown" {
+		t.Fatalf("expected first account cooldown, got %s", pool.Accounts[0].Status)
 	}
 }
