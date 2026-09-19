@@ -263,26 +263,60 @@ func (s *responsesSSEWriter) event(event string, data any) {
 // chatStreamToResponses 将上游 chat.completions SSE 流转换为 Responses SSE 流
 func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsage func(map[string]any)) {
 	model := ""
-	// 开场
 	s := newResponsesSSE(w)
 	s.event("response.created", map[string]any{
 		"type": "response.created",
 		"response": map[string]any{
-			"id":         s.respID,
-			"object":     "response",
-			"created_at": time.Now().Unix(),
-			"status":     "in_progress",
-			"model":      "",
-			"output":     []any{},
+			"id": s.respID, "object": "response", "created_at": time.Now().Unix(),
+			"status": "in_progress", "model": "", "output": []any{},
 		},
 	})
 	s.event("response.in_progress", map[string]any{"type": "response.in_progress", "response": map[string]any{"id": s.respID}})
 
+	type toolState struct {
+		sourceIndex int
+		outputIndex int
+		itemID      string
+		callID      string
+		name        string
+		args        strings.Builder
+		emitted     bool
+		emittedLen  int
+	}
+
+	nextOutputIndex := 0
+	textOutputIndex := -1
 	textEmitted := false
-	callEmitted := false
-	var curCallID, curCallName string
-	var curArgs strings.Builder
 	var outText strings.Builder
+	tools := map[int]*toolState{}
+	toolOrder := []int{}
+	var latestUsage map[string]any
+
+	emitToolStart := func(ts *toolState) {
+		if ts.emitted || ts.name == "" {
+			return
+		}
+		if ts.callID == "" {
+			ts.callID = fmt.Sprintf("call_%x_%d", time.Now().UnixNano(), ts.sourceIndex)
+		}
+		ts.emitted = true
+		s.event("response.output_item.added", map[string]any{
+			"type": "response.output_item.added",
+			"output_index": ts.outputIndex,
+			"item": map[string]any{
+				"type": "function_call", "id": ts.itemID, "call_id": ts.callID,
+				"name": ts.name, "arguments": "", "status": "in_progress",
+			},
+		})
+		if ts.args.Len() > ts.emittedLen {
+			delta := ts.args.String()[ts.emittedLen:]
+			s.event("response.function_call_arguments.delta", map[string]any{
+				"type": "response.function_call_arguments.delta",
+				"item_id": ts.itemID, "output_index": ts.outputIndex, "delta": delta,
+			})
+			ts.emittedLen = ts.args.Len()
+		}
+	}
 
 	reader := bufio.NewReader(upstream.Body)
 	for {
@@ -291,107 +325,103 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			line = strings.TrimRight(line, "\r\n")
 			if strings.HasPrefix(line, "data:") {
 				payload := strings.TrimSpace(line[5:])
-				if payload == "" || payload == "[DONE]" {
-					continue
-				}
-				var obj map[string]any
-				if json.Unmarshal([]byte(payload), &obj) != nil {
-					continue
-				}
-				if data, ok := obj["data"]; ok {
-					if d, ok := data.(map[string]any); ok {
-						obj = d
-					}
-				}
-				if m, ok := obj["model"].(string); ok && m != "" {
-					model = m
-				}
-				if onUsage != nil {
-					if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
-						onUsage(u)
-					}
-				}
-				choices, _ := obj["choices"].([]any)
-				if len(choices) == 0 {
-					continue
-				}
-				ch, _ := choices[0].(map[string]any)
-				if ch == nil {
-					continue
-				}
-				delta, _ := ch["delta"].(map[string]any)
-				if delta == nil {
-					delta = ch
-				}
-				// 文本
-				if c, ok := delta["content"].(string); ok && c != "" {
-					if !textEmitted {
-						textEmitted = true
-						s.event("response.output_item.added", map[string]any{
-							"type":       "response.output_item.added",
-							"output_index": 0,
-							"item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
-						})
-						s.event("response.content_part.added", map[string]any{
-							"type": "response.content_part.added",
-							"item_id": s.msgID,
-							"output_index": 0,
-							"content_index": 0,
-							"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
-						})
-					}
-					outText.WriteString(c)
-					s.event("response.output_text.delta", map[string]any{
-						"type": "response.output_text.delta",
-						"item_id": s.msgID,
-						"output_index": 0,
-						"content_index": 0,
-						"delta": c,
-					})
-				}
-				// 推理
-				if r, ok := delta["reasoning_content"].(string); ok && r != "" {
-					s.event("response.reasoning_summary_text.delta", map[string]any{
-						"type": "response.reasoning_summary_text.delta",
-						"item_id": s.msgID,
-						"output_index": 0,
-						"content_index": 0,
-						"delta": r,
-					})
-				}
-				// 工具调用
-				if tc, ok := delta["tool_calls"].([]any); ok {
-					for _, c := range tc {
-						cm, ok := c.(map[string]any)
-						if !ok {
-							continue
+				if payload != "" && payload != "[DONE]" {
+					var obj map[string]any
+					if json.Unmarshal([]byte(payload), &obj) == nil {
+						if data, ok := obj["data"].(map[string]any); ok {
+							obj = data
 						}
-						if id, ok := cm["id"].(string); ok && id != "" {
-							curCallID = id
+						if m, ok := obj["model"].(string); ok && m != "" {
+							model = m
 						}
-						fn, _ := cm["function"].(map[string]any)
-						if fn != nil {
-							if n, ok := fn["name"].(string); ok && n != "" {
-								curCallName = n
-							}
-							if a, ok := fn["arguments"].(string); ok && a != "" {
-								curArgs.WriteString(a)
+						if u, ok := obj["usage"].(map[string]any); ok && len(u) > 0 {
+							latestUsage = u
+							if onUsage != nil {
+								onUsage(u)
 							}
 						}
-						if !callEmitted && curCallName != "" {
-							callEmitted = true
-							s.event("response.output_item.added", map[string]any{
-								"type": "response.output_item.added",
-								"output_index": 1,
-								"item": map[string]any{
-									"type": "function_call",
-									"id":   "fc_" + curCallName,
-									"call_id": curCallID,
-									"name": curCallName,
-									"arguments": "",
-									"status": "in_progress",
-								},
-							})
+						choices, _ := obj["choices"].([]any)
+						if len(choices) > 0 {
+							ch, _ := choices[0].(map[string]any)
+							if ch != nil {
+								delta, _ := ch["delta"].(map[string]any)
+								if delta == nil {
+									delta = ch
+								}
+
+								if text, ok := delta["content"].(string); ok && text != "" {
+									if !textEmitted {
+										textEmitted = true
+										textOutputIndex = nextOutputIndex
+										nextOutputIndex++
+										s.event("response.output_item.added", map[string]any{
+											"type": "response.output_item.added", "output_index": textOutputIndex,
+											"item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "in_progress", "content": []any{}},
+										})
+										s.event("response.content_part.added", map[string]any{
+											"type": "response.content_part.added", "item_id": s.msgID,
+											"output_index": textOutputIndex, "content_index": 0,
+											"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+										})
+									}
+									outText.WriteString(text)
+									s.event("response.output_text.delta", map[string]any{
+										"type": "response.output_text.delta", "item_id": s.msgID,
+										"output_index": textOutputIndex, "content_index": 0, "delta": text,
+									})
+								}
+
+								if reasoning, ok := delta["reasoning_content"].(string); ok && reasoning != "" {
+									s.event("response.reasoning_summary_text.delta", map[string]any{
+										"type": "response.reasoning_summary_text.delta", "item_id": s.msgID,
+										"output_index": 0, "content_index": 0, "delta": reasoning,
+									})
+								}
+
+								if tcRaw, ok := delta["tool_calls"].([]any); ok {
+									for _, raw := range tcRaw {
+										cm, _ := raw.(map[string]any)
+										if cm == nil {
+											continue
+										}
+										idx := 0
+										if v, ok := cm["index"].(float64); ok {
+											idx = int(v)
+										}
+										ts := tools[idx]
+										if ts == nil {
+											ts = &toolState{
+												sourceIndex: idx,
+												outputIndex: nextOutputIndex,
+												itemID: fmt.Sprintf("fc_%x_%d", time.Now().UnixNano(), idx),
+											}
+											nextOutputIndex++
+											tools[idx] = ts
+											toolOrder = append(toolOrder, idx)
+										}
+										if id, ok := cm["id"].(string); ok && id != "" {
+											ts.callID = id
+										}
+										if fn, ok := cm["function"].(map[string]any); ok {
+											if name, ok := fn["name"].(string); ok && name != "" {
+												ts.name = name
+											}
+											if a, ok := fn["arguments"].(string); ok && a != "" {
+												ts.args.WriteString(a)
+											}
+										}
+										emitToolStart(ts)
+										if ts.emitted && ts.args.Len() > ts.emittedLen {
+											argDelta := ts.args.String()[ts.emittedLen:]
+											s.event("response.function_call_arguments.delta", map[string]any{
+												"type": "response.function_call_arguments.delta",
+												"item_id": ts.itemID, "output_index": ts.outputIndex, "delta": argDelta,
+											})
+											ts.emittedLen = ts.args.Len()
+										}
+									}
+								}
+							}
 						}
 					}
 				}
@@ -402,27 +432,65 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		}
 	}
 
-	// 收尾
+	outputByIndex := make(map[int]any, nextOutputIndex)
 	if textEmitted {
-		s.event("response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "text": outText.String()})
-		s.event("response.content_part.done", map[string]any{"type": "response.content_part.done", "item_id": s.msgID, "output_index": 0, "content_index": 0, "part": map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 0, "item": map[string]any{"id": s.msgID, "type": "message", "role": "assistant", "status": "completed", "content": []any{map[string]any{"type": "output_text", "text": outText.String(), "annotations": []any{}}}}})
+		text := outText.String()
+		s.event("response.output_text.done", map[string]any{
+			"type": "response.output_text.done", "item_id": s.msgID,
+			"output_index": textOutputIndex, "content_index": 0, "text": text,
+		})
+		s.event("response.content_part.done", map[string]any{
+			"type": "response.content_part.done", "item_id": s.msgID,
+			"output_index": textOutputIndex, "content_index": 0,
+			"part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+		})
+		msg := map[string]any{
+			"id": s.msgID, "type": "message", "role": "assistant", "status": "completed",
+			"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
+		}
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": textOutputIndex, "item": msg})
+		outputByIndex[textOutputIndex] = msg
 	}
-	if callEmitted {
-		s.event("response.function_call_arguments.done", map[string]any{"type": "response.function_call_arguments.done", "item_id": "fc_" + curCallName, "output_index": 1, "arguments": curArgs.String()})
-		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": 1, "item": map[string]any{"type": "function_call", "id": "fc_" + curCallName, "call_id": curCallID, "name": curCallName, "arguments": curArgs.String(), "status": "completed"}})
+
+	for _, idx := range toolOrder {
+		ts := tools[idx]
+		if ts == nil || ts.name == "" {
+			continue
+		}
+		emitToolStart(ts)
+		args := ts.args.String()
+		s.event("response.function_call_arguments.done", map[string]any{
+			"type": "response.function_call_arguments.done", "item_id": ts.itemID,
+			"output_index": ts.outputIndex, "arguments": args,
+		})
+		item := map[string]any{
+			"type": "function_call", "id": ts.itemID, "call_id": ts.callID,
+			"name": ts.name, "arguments": args, "status": "completed",
+		}
+		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": ts.outputIndex, "item": item})
+		outputByIndex[ts.outputIndex] = item
 	}
+
+	outputs := make([]any, 0, len(outputByIndex))
+	for i := 0; i < nextOutputIndex; i++ {
+		if item, ok := outputByIndex[i]; ok {
+			outputs = append(outputs, item)
+		}
+	}
+
+	usage := map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+	if latestUsage != nil {
+		if v, ok := latestUsage["prompt_tokens"]; ok { usage["input_tokens"] = v }
+		if v, ok := latestUsage["completion_tokens"]; ok { usage["output_tokens"] = v }
+		if v, ok := latestUsage["total_tokens"]; ok { usage["total_tokens"] = v }
+	}
+
 	s.event("response.completed", map[string]any{
 		"type": "response.completed",
 		"response": map[string]any{
-			"id":          s.respID,
-			"object":      "response",
-			"created_at":  time.Now().Unix(),
-			"status":      "completed",
-			"model":       model,
-			"output":      []any{},
-			"output_text": outText.String(),
-			"usage":       map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+			"id": s.respID, "object": "response", "created_at": time.Now().Unix(),
+			"status": "completed", "model": model, "output": outputs,
+			"output_text": outText.String(), "usage": usage,
 		},
 	})
 }
@@ -482,8 +550,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.Header().Set("Cache-Control", "no-cache")
 			w.Header().Set("Connection", "keep-alive")
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.WriteHeader(http.StatusOK)
+					w.WriteHeader(http.StatusOK)
 			chatStreamToResponses(w, resp, nil)
 			return
 		}
@@ -515,8 +582,7 @@ func handleResponses(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.WriteHeader(http.StatusOK)
+			w.WriteHeader(http.StatusOK)
 		chatStreamToResponses(w, up, usageFn)
 		return
 	}
