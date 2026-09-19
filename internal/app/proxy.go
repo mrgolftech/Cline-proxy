@@ -1043,7 +1043,7 @@ func anthropicToOpenAI(req anthropicReq) map[string]any {
 		}
 	}
 	if req.ToolChoice != nil {
-		openAI["tool_choice"] = req.ToolChoice
+		applyAnthropicToolChoice(openAI, req.ToolChoice)
 	}
 
 	msgs := []any{}
