@@ -129,7 +129,7 @@ func StartProxy(host string, port int) error {
 
 			valid := false
 			for _, k := range p.Keys {
-				if k == key {
+				if constantTimeEqual(k, key) {
 					valid = true
 					break
 				}
