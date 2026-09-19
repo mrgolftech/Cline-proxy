@@ -57,6 +57,23 @@ func TestAdminSecurityLoopbackAllowedWithoutPassword(t *testing.T) {
 	}
 }
 
+
+func TestAdminSecurityUsesForwardedIPFromLocalProxy(t *testing.T) {
+	t.Setenv("CLINE_ADMIN_PASSWORD", "")
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/admin/", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
+	req.Header.Set("X-Forwarded-For", "203.0.113.77")
+	rr := httptest.NewRecorder()
+
+	securityMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusForbidden {
+		t.Fatalf("expected forwarded remote client to require auth, got %d", rr.Code)
+	}
+}
+
 func TestAnthropicToolChoiceTranslation(t *testing.T) {
 	tests := []struct {
 		raw  string
