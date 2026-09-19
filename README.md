@@ -203,3 +203,49 @@ Model:    deepseek-v4-flash-free
 ---
 
 感谢 [LINUX DO](https://linux.do) 社区
+
+
+## Hermes / NewAPI 推荐接入
+
+对于 Hermes Agent、NewAPI 等需要稳定工具调用的客户端，优先使用 OpenAI Chat Completions：
+
+```text
+Base URL: http://<host>:3457/v1
+Endpoint: /chat/completions
+Model:    <Cline 可用模型>
+```
+
+当前 `/v1/chat/completions` 的工具调用链路最完整，支持 `tools`、`tool_choice`、`parallel_tool_calls`、`assistant.tool_calls` 与 `role=tool` 回传。`/v1/responses` 也支持并行工具调用流式转换，但建议在 Agent 场景先以 Chat Completions 作为主路径。
+
+### 安全部署
+
+默认行为经过加固：
+
+- 未配置 API Key 时，仅允许 loopback 客户端访问模型 API；远程访问必须先在管理后台生成 API Key。
+- `/admin/*` 默认仅允许本机访问。需要远程管理时必须设置 `CLINE_ADMIN_PASSWORD`。
+- 当 Cline-proxy 位于本机 Nginx/Nginx Proxy Manager 后方时，会仅在直连 peer 为 loopback 时读取 `X-Forwarded-For` / `X-Real-IP`，避免把公网反代请求误判为本机。
+- 远程账号 Token 导出默认禁用，即使已经通过管理后台 Basic Auth。
+
+可选环境变量：
+
+```bash
+CLINE_ADMIN_USER=admin
+CLINE_ADMIN_PASSWORD='change-me'
+CLINE_CORS_ORIGIN='https://your-console.example.com'
+# 只有确实需要远程导出 refreshToken 时才开启：
+CLINE_ALLOW_REMOTE_ACCOUNT_EXPORT=true
+```
+
+公网部署建议始终配置 API Key，并让 `/admin/` 仅通过受控入口访问。
+
+### 账号池故障转移
+
+单次请求现在最多尝试 3 个可用账号：
+
+- 网络错误：当前账号短暂冷却并切换下一个账号。
+- 401：刷新 Token 后使用全新的 HTTP Request 重试；仍失败则将账号标记为 expired 并切换。
+- 429：根据上游等待时间进入 cooldown，然后继续尝试下一个账号。
+- 408 / 502 / 503 / 504：短暂冷却后切换账号。
+- 其他 4xx：视为请求本身错误，不盲目换号。
+
+这可以减少 Hermes 多轮 Agent 任务因为单个账号临时限流而中断的概率。
