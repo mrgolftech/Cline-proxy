@@ -432,7 +432,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		}
 	}
 
-	outputs := []any{}
+	outputByIndex := make(map[int]any, nextOutputIndex)
 	if textEmitted {
 		text := outText.String()
 		s.event("response.output_text.done", map[string]any{
@@ -449,7 +449,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"content": []any{map[string]any{"type": "output_text", "text": text, "annotations": []any{}}},
 		}
 		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": textOutputIndex, "item": msg})
-		outputs = append(outputs, msg)
+		outputByIndex[textOutputIndex] = msg
 	}
 
 	for _, idx := range toolOrder {
@@ -468,7 +468,14 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 			"name": ts.name, "arguments": args, "status": "completed",
 		}
 		s.event("response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": ts.outputIndex, "item": item})
-		outputs = append(outputs, item)
+		outputByIndex[ts.outputIndex] = item
+	}
+
+	outputs := make([]any, 0, len(outputByIndex))
+	for i := 0; i < nextOutputIndex; i++ {
+		if item, ok := outputByIndex[i]; ok {
+			outputs = append(outputs, item)
+		}
 	}
 
 	usage := map[string]any{"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
