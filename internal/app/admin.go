@@ -750,19 +750,23 @@ func handleAdminProxyAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := getProxyConfig()
 	replaced := false
-	for i := range cfg.Proxies {
-		if cfg.Proxies[i].Name == name {
-			cfg.Proxies[i].URL = raw
-			replaced = true
-			break
+	cfg, err := mutateProxyConfig(func(cfg *proxyConfigData) error {
+		for i := range cfg.Proxies {
+			if cfg.Proxies[i].Name == name {
+				cfg.Proxies[i].URL = raw
+				replaced = true
+				return nil
+			}
 		}
-	}
-	if !replaced {
 		cfg.Proxies = append(cfg.Proxies, ProxyNode{Name: name, URL: raw})
+		return nil
+	})
+	if err != nil {
+		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: err.Error()})
+		return
 	}
-	setProxyConfig(cfg)
+	clearProxyNodeHealth(raw)
 	log.Printf("Proxy node %q %s (%s)", name, map[bool]string{true: "updated", false: "added"}[replaced], maskProxyURL(raw))
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "proxy added", Data: map[string]any{"proxies": cfg.Proxies}})
 }
@@ -793,15 +797,24 @@ func handleAdminProxyDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := getProxyConfig()
-	kept := cfg.Proxies[:0]
-	for _, p := range cfg.Proxies {
-		if p.Name != name {
+	var removedURL string
+	cfg, err := mutateProxyConfig(func(cfg *proxyConfigData) error {
+		kept := make([]ProxyNode, 0, len(cfg.Proxies))
+		for _, p := range cfg.Proxies {
+			if p.Name == name {
+				removedURL = p.URL
+				continue
+			}
 			kept = append(kept, p)
 		}
+		cfg.Proxies = kept
+		return nil
+	})
+	if err != nil {
+		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: err.Error()})
+		return
 	}
-	cfg.Proxies = kept
-	setProxyConfig(cfg)
+	clearProxyNodeHealth(removedURL)
 	log.Printf("Proxy node %q deleted", name)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "proxy deleted", Data: map[string]any{"proxies": cfg.Proxies}})
 }
@@ -1091,6 +1104,21 @@ func setProxyConfig(next *proxyConfigData) {
 	resetClineClients()
 }
 
+func mutateProxyConfig(mutator func(*proxyConfigData) error) (*proxyConfigData, error) {
+	proxyConfigMu.Lock()
+	next := cloneProxyConfig(proxyConfig)
+	if err := mutator(next); err != nil {
+		proxyConfigMu.Unlock()
+		return nil, err
+	}
+	proxyConfig = next
+	saveProxyConfigLocked()
+	snapshot := cloneProxyConfig(proxyConfig)
+	proxyConfigMu.Unlock()
+	resetClineClients()
+	return snapshot, nil
+}
+
 // GET /admin/api/keys
 func handleAdminGetKeys(w http.ResponseWriter, r *http.Request) {
 	p := loadPool()
@@ -1190,25 +1218,13 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := getProxyConfig()
-	changed := false
-
 	if req.Strategy != "" {
 		switch req.Strategy {
 		case "round_robin", "fill", "random":
-			cfg.Strategy = req.Strategy
-			changed = true
 		default:
 			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid strategy, must be: round_robin, fill, random"})
 			return
 		}
-	}
-
-	if req.Headers != nil {
-		for k, v := range req.Headers {
-			cfg.Headers[k] = v
-		}
-		changed = true
 	}
 
 	if req.DefaultModel != "" {
@@ -1221,17 +1237,28 @@ func handleAdminUpdateConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setDefaultModel(req.DefaultModel)
-		changed = true
 	}
 
-	if changed {
-		setProxyConfig(cfg)
+	cfg, err := mutateProxyConfig(func(cfg *proxyConfigData) error {
+		if req.Strategy != "" {
+			cfg.Strategy = req.Strategy
+		}
+		if req.Headers != nil {
+			for k, v := range req.Headers {
+				cfg.Headers[k] = v
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: err.Error()})
+		return
 	}
 
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Data: map[string]any{
 		"strategy":     cfg.Strategy,
 		"headers":      cfg.Headers,
-		"defaultModel": defaultModel,
+		"defaultModel": getDefaultModel(),
 	}})
 }
 
