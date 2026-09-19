@@ -21,7 +21,7 @@ type RequestLog struct {
 	Method   string    `json:"method"`
 	Path     string    `json:"path"`
 	Model    string    `json:"model,omitempty"`
-	Route    string    `json:"route"` // zen | cline | admin | other
+	Route    string    `json:"route"` // cline | admin | other
 	Status   int       `json:"status"`
 	Duration int64     `json:"duration_ms"`
 	Note     string    `json:"note,omitempty"`
