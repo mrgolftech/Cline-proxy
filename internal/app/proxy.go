@@ -4,7 +4,6 @@ import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -106,10 +105,19 @@ func StartProxy(host string, port int) error {
 
 	apiKeyHandler := func(next http.HandlerFunc) http.HandlerFunc {
 		return corsHandler(func(w http.ResponseWriter, r *http.Request) {
-			// Allow requests without key if no keys configured
+			// Without configured API keys, only loopback callers are trusted.
 			p := loadPool()
 			if len(p.Keys) == 0 {
-				next(w, r)
+				if isLoopbackRequest(r) {
+					next(w, r)
+					return
+				}
+				writeJSON(w, http.StatusUnauthorized, map[string]any{
+					"error": map[string]string{
+						"message": "remote API access requires an API key; generate one in /admin/",
+						"type":    "auth_error",
+					},
+				})
 				return
 			}
 
@@ -293,7 +301,7 @@ func StartProxy(host string, port int) error {
 	proxyListenAddress = addr
 	server := &http.Server{
 		Addr:    addr,
-		Handler: requestLogMiddleware(mux),
+		Handler: requestLogMiddleware(securityMiddleware(mux)),
 	}
 
 	fmt.Println("")
@@ -513,30 +521,12 @@ func clineHeaders(token, sessionID string) http.Header {
 }
 
 func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account, error) {
-	acc := pickAccount()
-	if acc == nil {
-		return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
-	}
-
-	token, err := ensureAccountToken(acc)
-	if err != nil {
-		// Try other accounts
-		return nil, nil, fmt.Errorf("account %s token failed: %w", acc.Email, err)
-	}
-
 	body := buildUpstreamBody(params, stream)
 	sessionID, _ := body["session_id"].(string)
-
 	bodyJSON, err := json.Marshal(body)
 	if err != nil {
-		return nil, acc, fmt.Errorf("marshal body: %w", err)
+		return nil, nil, fmt.Errorf("marshal body: %w", err)
 	}
-
-	req, err := http.NewRequest("POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
-	if err != nil {
-		return nil, acc, fmt.Errorf("create request: %w", err)
-	}
-	req.Header = clineHeaders(token, sessionID)
 
 	toolCount := 0
 	if tools, ok := params["tools"]; ok {
@@ -544,61 +534,103 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			toolCount = len(t)
 		}
 	}
-	log.Printf("  upstream: account=%s stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
-		truncateEmail(acc.Email), stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
 
-	resp, err := kit.HTTPClient.Do(req)
-	if err != nil {
-		// 网络错误：临时短冷却 5 分钟
-		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
-		return nil, acc, fmt.Errorf("upstream request: %w", err)
+	attempts := countEligibleAccounts()
+	if attempts > maxClineFailoverAttempts {
+		attempts = maxClineFailoverAttempts
+	}
+	if attempts <= 0 {
+		return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
 	}
 
-	if resp.StatusCode == 401 {
-		resp.Body.Close()
-		// Refresh token and retry
-		if err := refreshAccountToken(acc); err == nil {
-			token = acc.AccessToken
-			req.Header = clineHeaders(token, sessionID)
-			resp, err = kit.HTTPClient.Do(req)
-			if err != nil {
-				return nil, acc, fmt.Errorf("upstream retry: %w", err)
-			}
-			if resp.StatusCode == 401 {
-				resp.Body.Close()
-				poolMu.Lock()
-				acc.Status = "expired"
-				savePoolLocked()
-				poolMu.Unlock()
-				return nil, acc, fmt.Errorf("account %s token expired permanently", acc.Email)
-			}
-		} else {
-			poolMu.Lock()
-			acc.Status = "expired"
-			savePoolLocked()
-			poolMu.Unlock()
-			return nil, acc, fmt.Errorf("account %s refresh failed: %w", acc.Email, err)
+	tried := make(map[string]struct{}, attempts)
+	var lastErr error
+
+	for attempt := 1; attempt <= attempts; attempt++ {
+		acc := pickAccountExcluding(tried)
+		if acc == nil {
+			break
 		}
-	}
+		tried[acc.AccountID] = struct{}{}
 
-	if resp.StatusCode != 200 {
+		token, tokenErr := ensureAccountToken(acc)
+		if tokenErr != nil {
+			lastErr = fmt.Errorf("account %s token failed: %w", acc.Email, tokenErr)
+			log.Printf("  failover %d/%d: %v", attempt, attempts, lastErr)
+			continue
+		}
+
+		log.Printf("  upstream: account=%s attempt=%d/%d stream=%v tools=%d msgs=%d max_tokens=%v effort=%v",
+			truncateEmail(acc.Email), attempt, attempts, stream, toolCount, getMsgCount(params), body["max_tokens"], body["reasoning_effort"])
+
+		req, reqErr := newClineRequest(token, sessionID, bodyJSON)
+		if reqErr != nil {
+			return nil, acc, reqErr
+		}
+		resp, doErr := kit.HTTPClient.Do(req)
+		if doErr != nil {
+			markAccountCooldown(acc, "network error: "+doErr.Error(), 5*time.Minute)
+			lastErr = fmt.Errorf("account %s network error: %w", acc.Email, doErr)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			resp.Body.Close()
+			if refreshErr := refreshAccountToken(acc); refreshErr != nil {
+				lastErr = fmt.Errorf("account %s refresh failed: %w", acc.Email, refreshErr)
+				continue
+			}
+			// Rebuild the request so the JSON body is fresh after the first send.
+			req, reqErr = newClineRequest(acc.AccessToken, sessionID, bodyJSON)
+			if reqErr != nil {
+				return nil, acc, reqErr
+			}
+			resp, doErr = kit.HTTPClient.Do(req)
+			if doErr != nil {
+				markAccountCooldown(acc, "network error after refresh: "+doErr.Error(), 5*time.Minute)
+				lastErr = fmt.Errorf("account %s retry failed: %w", acc.Email, doErr)
+				continue
+			}
+			if resp.StatusCode == http.StatusUnauthorized {
+				resp.Body.Close()
+				markAccountExpired(acc, "401 after token refresh")
+				lastErr = fmt.Errorf("account %s token expired permanently", acc.Email)
+				continue
+			}
+		}
+
+		if resp.StatusCode == http.StatusOK {
+			bumpUsage(acc)
+			return resp, acc, nil
+		}
+
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		// Mark account on cooldown on rate limits
-		if resp.StatusCode == 429 {
-			reason := kit.Truncate(string(bodyBytes), 500)
+		reason := kit.Truncate(string(bodyBytes), 500)
+
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests:
 			duration := parseInferenceCapDuration(string(bodyBytes))
 			if duration <= 0 {
 				duration = parseRetryAfter(resp.Header.Get("Retry-After"))
 			}
 			markAccountCooldown(acc, "429: "+reason, duration)
-			log.Printf("  account %s cooldown %v (reason: %s)", truncateEmail(acc.Email), duration, reason)
+			lastErr = fmt.Errorf("account %s rate limited: %s", acc.Email, reason)
+			log.Printf("  account %s cooldown %v; failing over", truncateEmail(acc.Email), duration)
+			continue
+		case http.StatusRequestTimeout, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			markAccountCooldown(acc, fmt.Sprintf("%d: %s", resp.StatusCode, reason), time.Minute)
+			lastErr = fmt.Errorf("account %s transient upstream %d: %s", acc.Email, resp.StatusCode, reason)
+			continue
+		default:
+			return nil, acc, fmt.Errorf("API %d: %s", resp.StatusCode, reason)
 		}
-		return nil, acc, fmt.Errorf("API %d: %s", resp.StatusCode, kit.Truncate(string(bodyBytes), 500))
 	}
 
-	bumpUsage(acc)
-	return resp, acc, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no eligible account remained")
+	}
+	return nil, nil, fmt.Errorf("all candidate accounts failed after %d attempt(s): %w", len(tried), lastErr)
 }
 
 // accountUsageFn 构造账号 token 记账回调：从上游 usage 提取
