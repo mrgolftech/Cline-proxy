@@ -75,20 +75,6 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/models/refresh", corsHandler(handleAdminModelsRefresh))
 	mux.HandleFunc("/admin/api/config", corsHandler(handleAdminConfig))
 	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
-	mux.HandleFunc("/admin/api/opencode/config", corsHandler(handleZenConfig))
-	mux.HandleFunc("/admin/api/opencode/config/update", corsHandler(handleZenConfigUpdate))
-	mux.HandleFunc("/admin/api/opencode/models", corsHandler(handleZenModels))
-	mux.HandleFunc("/admin/api/opencode/models/refresh", corsHandler(handleZenModelsRefresh))
-	mux.HandleFunc("/admin/api/opencode/stats", corsHandler(handleZenStats))
-	// 旧 zen 路径别名,兼容旧引用
-	mux.HandleFunc("/admin/api/zen/config", corsHandler(handleZenConfig))
-	mux.HandleFunc("/admin/api/zen/config/update", corsHandler(handleZenConfigUpdate))
-	mux.HandleFunc("/admin/api/zen/models", corsHandler(handleZenModels))
-	mux.HandleFunc("/admin/api/zen/models/refresh", corsHandler(handleZenModelsRefresh))
-	mux.HandleFunc("/admin/api/zen/stats", corsHandler(handleZenStats))
-	mux.HandleFunc("/admin/zen/", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/admin/", http.StatusFound)
-	})
 }
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
@@ -663,6 +649,7 @@ func handleAdminAccountProxy(w http.ResponseWriter, r *http.Request) {
 
 	if req.Proxies != nil {
 		names := []string{}
+		seen := map[string]struct{}{}
 		for _, n := range req.Proxies {
 			n = strings.TrimSpace(n)
 			if n == "" {
@@ -672,9 +659,16 @@ func handleAdminAccountProxy(w http.ResponseWriter, r *http.Request) {
 				writeAPI(w, http.StatusBadRequest, apiResponse{Error: "unknown proxy node: " + n})
 				return
 			}
+			if _, dup := seen[n]; dup {
+				continue
+			}
+			seen[n] = struct{}{}
 			names = append(names, n)
 		}
 		setAccountProxies(acc, names)
+		if req.Proxy == nil {
+			setAccountProxy(acc, "")
+		}
 	}
 	if req.Proxy != nil {
 		u := strings.TrimSpace(*req.Proxy)
@@ -707,6 +701,19 @@ func validateProxyURL(raw string) error {
 	return fmt.Errorf("proxy scheme must be http/https/socks5/socks5h")
 }
 
+func validProxyNodeName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
 // POST /admin/api/proxies/add  body: { name, url }
 func handleAdminProxyAdd(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
@@ -732,6 +739,10 @@ func handleAdminProxyAdd(w http.ResponseWriter, r *http.Request) {
 	raw := strings.TrimSpace(req.URL)
 	if name == "" || raw == "" {
 		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "name and url are required"})
+		return
+	}
+	if !validProxyNodeName(name) {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "proxy node name may only contain letters, numbers, dot, underscore and hyphen (max 64)"})
 		return
 	}
 	if err := validateProxyURL(raw); err != nil {
