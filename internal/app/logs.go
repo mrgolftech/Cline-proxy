@@ -160,8 +160,6 @@ func requestLogMiddleware(next http.Handler) http.Handler {
 		switch {
 		case strings.HasPrefix(r.URL.Path, "/admin"):
 			route = "admin"
-		case strings.HasPrefix(model, "zen/"):
-			route = "zen"
 		case model != "":
 			route = "cline"
 		case strings.Contains(r.URL.Path, "models") || strings.Contains(r.URL.Path, "health"):
