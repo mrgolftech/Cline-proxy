@@ -1,7 +1,6 @@
 package app
 
 import (
-	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"bufio"
 	"encoding/json"
