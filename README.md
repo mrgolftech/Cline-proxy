@@ -249,3 +249,5 @@ CLINE_ALLOW_REMOTE_ACCOUNT_EXPORT=true
 - 其他 4xx：视为请求本身错误，不盲目换号。
 
 这可以减少 Hermes 多轮 Agent 任务因为单个账号临时限流而中断的概率。
+
+<!-- CI trigger: hardening/hermes-agent-gateway -->
