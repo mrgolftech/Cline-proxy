@@ -310,7 +310,7 @@ func chatStreamToResponses(w http.ResponseWriter, upstream *http.Response, onUsa
 		})
 		if ts.args.Len() > ts.emittedLen {
 			delta := ts.args.String()[ts.emittedLen:]
-			ts.event("response.function_call_arguments.delta", map[string]any{
+			s.event("response.function_call_arguments.delta", map[string]any{
 				"type": "response.function_call_arguments.delta",
 				"item_id": ts.itemID, "output_index": ts.outputIndex, "delta": delta,
 			})
