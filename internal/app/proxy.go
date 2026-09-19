@@ -151,23 +151,6 @@ func StartProxy(host string, port int) error {
 	modelsHandler := apiKeyHandler(func(w http.ResponseWriter, r *http.Request) {
 		ensureModelsFresh()
 		data := apiModelList()
-		// 合并 zen 免费模型
-		cfg := getZenConfig()
-		if cfg.Enabled {
-			for _, zm := range zenModelList() {
-				data = append(data, map[string]any{
-					"id":       zm["id"],
-					"object":   "model",
-					"created":  time.Now().UnixMilli(),
-					"owned_by": "opencode-zen",
-					"source":   "zen-free",
-					"status":   "active",
-					"cost":     "free",
-					"context":  zm["context"],
-					"output":   zm["output"],
-				})
-			}
-		}
 		writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 	})
 	mux.HandleFunc("/v1/models", modelsHandler)
