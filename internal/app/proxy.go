@@ -607,7 +607,7 @@ func accountUsageFn(acc *Account, params map[string]any) func(map[string]any) {
 		}
 		tokens := int64(pt + ct)
 		if tokens <= 0 && params != nil {
-			// 上游未返回 usage 时用入站请求估算兜底（与 zen 统计一致）
+			// 上游未返回 usage 时用入站请求估算兜底
 			tokens = int64(estimateJSON(params))
 		}
 		recordAccountTokens(acc, tokens)
