@@ -108,8 +108,8 @@ func TestAnthropicToolChoiceTranslation(t *testing.T) {
 
 func TestResponsesStreamingKeepsParallelToolCallsSeparate(t *testing.T) {
 	sse := strings.Join([]string{
-		`data: {"model":"test-model","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\\"path\\":\\"a.txt\\"}"}}]}}]}`,
-		`data: {"model":"test-model","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search_code","arguments":"{\\"query\\":\\"needle\\"}"}}]}}]}`,
+		`data: {"model":"test-model","choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]}}]}`,
+		`data: {"model":"test-model","choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_b","function":{"name":"search_code","arguments":"{\"query\":\"needle\"}"}}]}}]}`,
 		`data: [DONE]`,
 	}, "\n\n") + "\n\n"
 
