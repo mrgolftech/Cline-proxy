@@ -1,6 +1,8 @@
 package app
 
 import (
+	"cline-go-proxy/internal/kit"
+
 	"bufio"
 	"context"
 	"crypto/tls"
@@ -219,6 +221,37 @@ func dialViaProxy(ctx context.Context, raw, network, addr string) (net.Conn, err
 	default:
 		return nil, fmt.Errorf("unsupported proxy scheme %q", u.Scheme)
 	}
+}
+
+// ---- Cline 账号池：按账号绑定的出口代理构造 HTTP 客户端 ----
+
+var (
+	clineClients   = map[string]*http.Client{}
+	clineClientsMu sync.Mutex
+)
+
+// clineClientFor 返回走指定出口代理的 HTTP 客户端；proxyURL 为空则用直连的全局客户端。
+// 结果按代理 URL 缓存，避免每请求重建连接池。
+func clineClientFor(proxyURL string) *http.Client {
+	if proxyURL == "" {
+		return kit.HTTPClient
+	}
+	clineClientsMu.Lock()
+	defer clineClientsMu.Unlock()
+	if c, ok := clineClients[proxyURL]; ok {
+		return c
+	}
+	t := &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+	}
+	t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return dialViaProxy(ctx, proxyURL, network, addr)
+	}
+	c := &http.Client{Transport: t}
+	clineClients[proxyURL] = c
+	return c
 }
 
 // dialHTTPProxy 通过 http(s) 代理建立 CONNECT 隧道

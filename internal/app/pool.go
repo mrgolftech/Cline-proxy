@@ -247,6 +247,7 @@ func ListAccounts() []*Account {
 			CreatedAt:       a.CreatedAt,
 			CooldownUntil:   a.CooldownUntil,
 			LastReason:     a.LastReason,
+			Proxy:           a.Proxy,
 		}
 	}
 	savePoolLocked()
@@ -267,6 +268,17 @@ func markAccountCooldown(acc *Account, reason string, duration time.Duration) {
 	acc.Status = "cooldown"
 	acc.CooldownUntil = time.Now().Add(duration)
 	acc.LastReason = reason
+	savePoolLocked()
+	poolMu.Unlock()
+}
+
+// setAccountProxy 设置账号绑定的出口代理（空=直连），并落盘。
+func setAccountProxy(acc *Account, proxy string) {
+	if acc == nil {
+		return
+	}
+	poolMu.Lock()
+	acc.Proxy = proxy
 	savePoolLocked()
 	poolMu.Unlock()
 }

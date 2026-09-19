@@ -548,7 +548,7 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		if reqErr != nil {
 			return nil, acc, reqErr
 		}
-		resp, doErr := kit.HTTPClient.Do(req)
+		resp, doErr := clineClientFor(acc.Proxy).Do(req)
 		if doErr != nil {
 			markAccountCooldown(acc, "network error: "+doErr.Error(), 5*time.Minute)
 			lastErr = fmt.Errorf("account %s network error: %w", acc.Email, doErr)
@@ -566,7 +566,7 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 			if reqErr != nil {
 				return nil, acc, reqErr
 			}
-			resp, doErr = kit.HTTPClient.Do(req)
+			resp, doErr = clineClientFor(acc.Proxy).Do(req)
 			if doErr != nil {
 				markAccountCooldown(acc, "network error after refresh: "+doErr.Error(), 5*time.Minute)
 				lastErr = fmt.Errorf("account %s retry failed: %w", acc.Email, doErr)

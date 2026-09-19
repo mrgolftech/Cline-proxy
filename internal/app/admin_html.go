@@ -244,10 +244,10 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>邮箱</th><th>状态</th><th title="本代理本地统计，不代表官方免费额度">今日/累计 Tokens</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr>
+        <tr><th>邮箱</th><th>状态</th><th title="本代理本地统计，不代表官方免费额度">今日/累计 Tokens</th><th>出口代理</th><th>最后使用</th><th>创建时间</th><th>操作</th></tr>
       </thead>
       <tbody id="accountTableBody">
-        <tr><td colspan="6" class="empty">加载中...</td></tr>
+        <tr><td colspan="7" class="empty">加载中...</td></tr>
       </tbody>
     </table>
     </div>
@@ -550,7 +550,7 @@ async function loadAccounts() {
     const list = d.data.accounts;
     const tbody = _('accountTableBody');
     if (!list || list.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" class="empty">暂无账号，前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">导入账号</a> 页添加</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无账号，前往 <a href="#" onclick="switchTab(\'import\')" style="color:var(--accent);cursor:pointer">导入账号</a> 页添加</td></tr>';
       return;
     }
     const sn = { active: '活跃', cooldown: '冷却', expired: '已过期' };
@@ -567,6 +567,7 @@ async function loadAccounts() {
         '<td>' + esc(a.email) + '</td>' +
         '<td><span class="status ' + a.status + '"><span class="status-dot ' + a.status + '"></span>' + (sn[a.status] || a.status) + '</span>' + statusExtra + '</td>' +
           '<td title="今日 ' + fmtNum(a.tokensToday) + ' / 累计 ' + fmtNum(a.tokensTotal) + ' tokens（上游返回 usage 时精确，否则为估算值）">' + fmtTokens(a.tokensToday) + ' / ' + fmtTokens(a.tokensTotal) + '</td>' +
+        '<td style="white-space:nowrap"><input class="acct-proxy" data-id="' + a.accountId + '" value="' + esc(a.proxy || '') + '" placeholder="http://user:pass@host:port" style="width:170px;font-size:11px;padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text)"> <button class="btn btn-sm" onclick="setAccountProxy(\'' + a.accountId + '\', this)" title="保存出口代理（空=直连）">💾</button></td>' +
         '<td class="mono" style="font-size:11px">' + lu + '</td>' +
         '<td class="mono" style="font-size:11px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
@@ -576,6 +577,21 @@ async function loadAccounts() {
         '</td></tr>';
     }).join('');
   } catch (e) { toast('加载账号失败: ' + e.message, 'error'); }
+}
+
+async function setAccountProxy(id, btn) {
+  const input = document.querySelector('input.acct-proxy[data-id="' + id + '"]');
+  const proxy = input ? input.value.trim() : '';
+  if (btn) { btn.disabled = true; }
+  try {
+    await api('POST', '/accounts/proxy', { accountId: id, proxy });
+    toast('出口代理已保存' + (proxy ? '' : '（已设为直连）'), 'success');
+    loadAccounts();
+  } catch (e) {
+    toast('保存失败: ' + e.message, 'error');
+  } finally {
+    if (btn) { btn.disabled = false; }
+  }
 }
 
 async function testAccount(id, btn) {

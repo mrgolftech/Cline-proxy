@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -51,6 +52,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/add", corsHandler(handleAdminAccountAdd))
 	mux.HandleFunc("/admin/api/accounts/delete", corsHandler(handleAdminAccountDelete))
 	mux.HandleFunc("/admin/api/accounts/test", corsHandler(handleAdminAccountTest))
+	mux.HandleFunc("/admin/api/accounts/proxy", corsHandler(handleAdminAccountProxy))
 	mux.HandleFunc("/admin/api/oauth/start", corsHandler(handleOAuthStart))
 	mux.HandleFunc("/admin/api/oauth/status", corsHandler(handleOAuthStatus))
 	mux.HandleFunc("/admin/api/sso/import", corsHandler(handleSSOImport))
@@ -625,6 +627,58 @@ func handleAdminAccountTest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /admin/api/accounts/proxy  body: { accountId, proxy }
+// 绑定/解绑某账号的出口代理（空字符串=直连）。用于 muse 等地区受限模型 + 账号↔出口IP 绑定。
+func handleAdminAccountProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		AccountID string `json:"accountId"`
+		Proxy     string `json:"proxy"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
+		return
+	}
+	acc := getAccountByID(req.AccountID)
+	if acc == nil {
+		writeAPI(w, http.StatusNotFound, apiResponse{Error: "account not found"})
+		return
+	}
+
+	proxy := strings.TrimSpace(req.Proxy)
+	if proxy != "" {
+		u, perr := url.Parse(proxy)
+		if perr != nil || u.Host == "" {
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid proxy URL"})
+			return
+		}
+		switch u.Scheme {
+		case "http", "https", "socks5", "socks5h":
+		default:
+			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "proxy scheme must be http/https/socks5/socks5h"})
+			return
+		}
+	}
+
+	setAccountProxy(acc, proxy)
+	log.Printf("Account %s proxy set to %q", truncateEmail(acc.Email), maskProxyURL(proxy))
+	writeAPI(w, http.StatusOK, apiResponse{
+		Success: true,
+		Message: "proxy updated",
+		Data:    map[string]any{"accountId": acc.AccountID, "proxy": acc.Proxy},
+	})
+}
+
 // testAccount 对单个账号执行轻量探测请求，返回详细结果与最终状态。
 // 测试按钮是"升级版重置"：无论账号当前是 active/cooldown/expired，
 // 都会尝试刷新 Token 并发起一次真实探测；成功则清除所有异常状态。
@@ -681,7 +735,7 @@ func testAccount(acc *Account) (map[string]any, string) {
 	}
 	req.Header = clineHeaders(token, sessionID)
 
-	resp, err := kit.HTTPClient.Do(req)
+	resp, err := clineClientFor(acc.Proxy).Do(req)
 	if err != nil {
 		// 网络错误：5 分钟短冷却
 		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
