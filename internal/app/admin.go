@@ -3,8 +3,9 @@ package app
 import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -57,7 +58,6 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/proxies/add", corsHandler(handleAdminProxyAdd))
 	mux.HandleFunc("/admin/api/proxies/delete", corsHandler(handleAdminProxyDelete))
 	mux.HandleFunc("/admin/api/proxies/test", corsHandler(handleAdminProxyTest))
-	mux.HandleFunc("/admin/api/model-proxies", corsHandler(handleAdminModelProxies))
 	mux.HandleFunc("/admin/api/oauth/start", corsHandler(handleOAuthStart))
 	mux.HandleFunc("/admin/api/oauth/status", corsHandler(handleOAuthStatus))
 	mux.HandleFunc("/admin/api/sso/import", corsHandler(handleSSOImport))
@@ -790,23 +790,9 @@ func handleAdminProxyDelete(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	cfg.Proxies = kept
-	// 同步清理模型规则里的该节点
-	for m, nodes := range cfg.ModelProxies {
-		filtered := nodes[:0]
-		for _, n := range nodes {
-			if n != name {
-				filtered = append(filtered, n)
-			}
-		}
-		if len(filtered) == 0 {
-			delete(cfg.ModelProxies, m)
-		} else {
-			cfg.ModelProxies[m] = filtered
-		}
-	}
 	setProxyConfig(cfg)
 	log.Printf("Proxy node %q deleted", name)
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "proxy deleted", Data: map[string]any{"proxies": cfg.Proxies, "modelProxies": cfg.ModelProxies}})
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "proxy deleted", Data: map[string]any{"proxies": cfg.Proxies}})
 }
 
 // POST /admin/api/proxies/test  body: { name }
@@ -841,6 +827,7 @@ func handleAdminProxyTest(w http.ResponseWriter, r *http.Request) {
 	probe, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.cloudflare.com/cdn-cgi/trace", nil)
 	resp, err := clineClientFor(node.URL).Do(probe)
 	if err != nil {
+		recordProxyNodeFailure(node.URL, err.Error())
 		writeAPI(w, http.StatusOK, apiResponse{Success: false, Message: "connect failed",
 			Data: map[string]any{"ok": false, "error": err.Error()}})
 		return
@@ -848,6 +835,11 @@ func handleAdminProxyTest(w http.ResponseWriter, r *http.Request) {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	ip, loc := parseTraceLine(string(b))
+	if resp.StatusCode == http.StatusOK {
+		recordProxyNodeSuccess(node.URL)
+	} else {
+		recordProxyNodeFailure(node.URL, fmt.Sprintf("probe HTTP %d", resp.StatusCode))
+	}
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "ok",
 		Data: map[string]any{"ok": resp.StatusCode == http.StatusOK, "httpStatus": resp.StatusCode, "ip": ip, "loc": loc}})
 }
@@ -865,66 +857,13 @@ func parseTraceLine(s string) (ip, loc string) {
 	return
 }
 
-// POST /admin/api/model-proxies  body: { model, nodes:[节点名] }  nodes 为空 => 删除该模型规则
-func handleAdminModelProxies(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" {
-		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
-		return
-	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
-		return
-	}
-	defer r.Body.Close()
-
-	var req struct {
-		Model string   `json:"model"`
-		Nodes []string `json:"nodes"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
-		return
-	}
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "model is required"})
-		return
-	}
-
-	cfg := getProxyConfig()
-	names := []string{}
-	for _, n := range req.Nodes {
-		n = strings.TrimSpace(n)
-		if n == "" {
-			continue
-		}
-		if _, ok := poolNodeByName(n); !ok {
-			writeAPI(w, http.StatusBadRequest, apiResponse{Error: "unknown proxy node: " + n})
-			return
-		}
-		names = append(names, n)
-	}
-	if len(names) == 0 {
-		delete(cfg.ModelProxies, model)
-	} else {
-		cfg.ModelProxies[model] = names
-	}
-	setProxyConfig(cfg)
-	log.Printf("Model %q proxy rule set to %v", model, names)
-	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "rule saved", Data: map[string]any{"modelProxies": cfg.ModelProxies}})
-}
-
 // testAccount 对单个账号执行轻量探测请求，返回详细结果与最终状态。
 // 测试按钮是"升级版重置"：无论账号当前是 active/cooldown/expired，
 // 都会尝试刷新 Token 并发起一次真实探测；成功则清除所有异常状态。
 // 返回的 status: active / cooldown / expired / error
 func testAccount(acc *Account) (map[string]any, string) {
 	prevStatus := acc.Status
-	prevCooldownUntil := acc.CooldownUntil
-	_ = prevCooldownUntil
 
-	// 取 token（expired/cooldown 也尝试刷新，测试按钮不因状态直接拒绝）
 	token, err := ensureAccountToken(acc)
 	if err != nil {
 		poolMu.Lock()
@@ -934,16 +873,11 @@ func testAccount(acc *Account) (map[string]any, string) {
 		savePoolLocked()
 		poolMu.Unlock()
 		return map[string]any{
-			"accountId":  acc.AccountID,
-			"email":      acc.Email,
-			"status":     "expired",
-			"reason":     acc.LastReason,
-			"prevStatus": prevStatus,
+			"accountId": acc.AccountID, "email": acc.Email, "status": "expired",
+			"reason": acc.LastReason, "prevStatus": prevStatus,
 		}, "expired"
 	}
 
-	// 构造极小探测请求：max_tokens=1, 单条用户消息。探测请求需与正常代理请求
-	// 使用相同的模型选择、流式策略和任务 ID，否则部分模型会返回空响应。
 	probeModel := getDefaultModel()
 	sessionID := fmt.Sprintf("test_%d", time.Now().UnixMilli())
 	probeBody := map[string]any{
@@ -958,97 +892,66 @@ func testAccount(acc *Account) (map[string]any, string) {
 	if modelNeedsStream(probeModel) {
 		probeBody["stream"] = true
 	}
-	bodyJSON, _ := json.Marshal(probeBody)
-
-	req, err := http.NewRequest("POST", cline.ClineAPIBase+"/chat/completions", bytes.NewReader(bodyJSON))
+	bodyJSON, err := json.Marshal(probeBody)
 	if err != nil {
 		return map[string]any{
-			"accountId": acc.AccountID,
-			"email":     acc.Email,
-			"status":    "error",
-			"reason":    "build request: " + err.Error(),
+			"accountId": acc.AccountID, "email": acc.Email, "status": "error",
+			"reason": "marshal probe: " + err.Error(),
 		}, "error"
 	}
-	req.Header = clineHeaders(token, sessionID)
 
-	resp, err := clineClientFor(acc.Proxy).Do(req)
+	nodes, err := effectiveNodes(acc)
 	if err != nil {
-		// 网络错误：5 分钟短冷却
-		markAccountCooldown(acc, "network error: "+err.Error(), 5*time.Minute)
 		return map[string]any{
-			"accountId": acc.AccountID,
-			"email":     acc.Email,
-			"status":    "cooldown",
-			"reason":    acc.LastReason,
-			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
-			"remaining": formatDuration(time.Until(acc.CooldownUntil)),
-		}, "cooldown"
+			"accountId": acc.AccountID, "email": acc.Email, "status": "error",
+			"reason": err.Error(), "prevStatus": prevStatus,
+		}, "error"
+	}
+
+	resp, err := tryAccountOverNodes(acc, token, sessionID, bodyJSON, nodes)
+	if err != nil {
+		switch acc.Status {
+		case "cooldown":
+			return map[string]any{
+				"accountId": acc.AccountID, "email": acc.Email, "status": "cooldown",
+				"reason": acc.LastReason,
+				"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
+				"remaining": formatDuration(time.Until(acc.CooldownUntil)),
+				"prevStatus": prevStatus,
+			}, "cooldown"
+		case "expired":
+			return map[string]any{
+				"accountId": acc.AccountID, "email": acc.Email, "status": "expired",
+				"reason": acc.LastReason, "prevStatus": prevStatus,
+			}, "expired"
+		default:
+			return map[string]any{
+				"accountId": acc.AccountID, "email": acc.Email, "status": "error",
+				"reason": err.Error(), "prevStatus": prevStatus,
+			}, "error"
+		}
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
-	bodyStr := string(bodyBytes)
-
-	if resp.StatusCode == 429 {
-		duration := parseInferenceCapDuration(bodyStr)
-		if duration <= 0 {
-			duration = parseRetryAfter(resp.Header.Get("Retry-After"))
-		}
-		reason := kit.Truncate(bodyStr, 500)
-		markAccountCooldown(acc, "429: "+reason, duration)
-		log.Printf("Test hit 429 on %s, cooldown %v", truncateEmail(acc.Email), duration)
-		return map[string]any{
-			"accountId":     acc.AccountID,
-			"email":         acc.Email,
-			"status":        "cooldown",
-			"reason":        acc.LastReason,
-			"cooldownUntil": acc.CooldownUntil.Format("2006-01-02 15:04:05"),
-			"remaining":     formatDuration(time.Until(acc.CooldownUntil)),
-			"httpStatus":    resp.StatusCode,
-		}, "cooldown"
-	}
-
-	if resp.StatusCode == 401 {
-		poolMu.Lock()
-		acc.Status = "expired"
-		acc.LastReason = "401 unauthorized"
-		acc.CooldownUntil = time.Time{}
-		savePoolLocked()
-		poolMu.Unlock()
-		return map[string]any{
-			"accountId":  acc.AccountID,
-			"email":      acc.Email,
-			"status":     "expired",
-			"reason":     acc.LastReason,
-			"httpStatus": resp.StatusCode,
-		}, "expired"
-	}
-
-	if resp.StatusCode != 200 {
-		// 其它错误：不强制冷却，按一次失败处理
-		return map[string]any{
-			"accountId":  acc.AccountID,
-			"email":      acc.Email,
-			"status":     "error",
-			"reason":     fmt.Sprintf("API %d: %s", resp.StatusCode, kit.Truncate(bodyStr, 300)),
-			"httpStatus": resp.StatusCode,
-		}, "error"
-	}
-
-	// 成功：清除所有异常状态（冷却/过期/原因），并递增使用计数
 	poolMu.Lock()
 	acc.Status = "active"
 	acc.LastReason = ""
 	acc.CooldownUntil = time.Time{}
+	savePoolLocked()
 	poolMu.Unlock()
-	bumpUsage(acc)
+
+	maskedNodes := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		if node == "" {
+			maskedNodes = append(maskedNodes, "direct")
+		} else {
+			maskedNodes = append(maskedNodes, maskProxyURL(node))
+		}
+	}
 	return map[string]any{
-		"accountId":  acc.AccountID,
-		"email":      acc.Email,
-		"status":     "active",
-		"reason":     "ok",
-		"httpStatus": resp.StatusCode,
-		"prevStatus": prevStatus,
+		"accountId": acc.AccountID, "email": acc.Email, "status": "active",
+		"reason": "ok", "httpStatus": resp.StatusCode, "prevStatus": prevStatus,
+		"nodes": maskedNodes,
 	}, "active"
 }
 
@@ -1085,7 +988,7 @@ func formatDuration(d time.Duration) string {
 // Global proxy config (mutable via API, persisted to disk)
 var (
 	proxyConfig   = loadProxyConfig()
-	proxyConfigMu sync.Mutex
+	proxyConfigMu sync.RWMutex
 )
 
 func proxyConfigPath() string { return kit.ResolveDataPath(".proxy-config.json") }
@@ -1107,9 +1010,6 @@ func loadProxyConfig() *proxyConfigData {
 	if cfg.Proxies == nil {
 		cfg.Proxies = []ProxyNode{}
 	}
-	if cfg.ModelProxies == nil {
-		cfg.ModelProxies = map[string][]string{}
-	}
 	return cfg
 }
 
@@ -1127,10 +1027,9 @@ type ProxyNode struct {
 }
 
 type proxyConfigData struct {
-	Strategy     string              `json:"strategy"`
-	Headers      map[string]string   `json:"headers"`
-	Proxies      []ProxyNode         `json:"proxies"`      // 全局代理池
-	ModelProxies map[string][]string `json:"modelProxies"` // 模型 -> 允许的节点名称（按序）
+	Strategy string            `json:"strategy"`
+	Headers  map[string]string `json:"headers"`
+	Proxies  []ProxyNode       `json:"proxies"`
 }
 
 func defaultProxyConfig() *proxyConfigData {
@@ -1147,22 +1046,38 @@ func defaultProxyConfig() *proxyConfigData {
 			"X-PLATFORM-VERSION": "4.1.19",
 			"X-CORE-VERSION":     "0.0.83",
 		},
-		Proxies:      []ProxyNode{},
-		ModelProxies: map[string][]string{},
+		Proxies: []ProxyNode{},
 	}
 }
 
-func getProxyConfig() *proxyConfigData {
-	proxyConfigMu.Lock()
-	defer proxyConfigMu.Unlock()
-	return proxyConfig
+func cloneProxyConfig(src *proxyConfigData) *proxyConfigData {
+	if src == nil {
+		return defaultProxyConfig()
+	}
+	out := &proxyConfigData{
+		Strategy: src.Strategy,
+		Headers:  make(map[string]string, len(src.Headers)),
+		Proxies:  append([]ProxyNode(nil), src.Proxies...),
+	}
+	for k, v := range src.Headers {
+		out.Headers[k] = v
+	}
+	return out
 }
 
-func setProxyConfig(c *proxyConfigData) {
+func getProxyConfig() *proxyConfigData {
+	proxyConfigMu.RLock()
+	defer proxyConfigMu.RUnlock()
+	return cloneProxyConfig(proxyConfig)
+}
+
+func setProxyConfig(next *proxyConfigData) {
+	copy := cloneProxyConfig(next)
 	proxyConfigMu.Lock()
-	defer proxyConfigMu.Unlock()
-	proxyConfig = c
+	proxyConfig = copy
 	saveProxyConfigLocked()
+	proxyConfigMu.Unlock()
+	resetClineClients()
 }
 
 // GET /admin/api/keys
@@ -1177,7 +1092,12 @@ func handleAdminGenerateKey(w http.ResponseWriter, r *http.Request) {
 		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
 		return
 	}
-	key := fmt.Sprintf("cline_%x_%x", time.Now().UnixMilli(), time.Now().UnixNano()%1000000)
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		writeAPI(w, http.StatusInternalServerError, apiResponse{Error: "generate API key: " + err.Error()})
+		return
+	}
+	key := "cline_" + hex.EncodeToString(raw)
 	p := loadPool()
 	poolMu.Lock()
 	p.Keys = append(p.Keys, key)
@@ -1233,7 +1153,6 @@ func handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 		"defaultModel": getDefaultModel(),
 		"headers":      cfg.Headers,
 		"proxies":      cfg.Proxies,
-		"modelProxies": cfg.ModelProxies,
 	}})
 }
 
