@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -791,11 +792,38 @@ func formatDuration(d time.Duration) string {
 	return strings.Join(parts, " ")
 }
 
-// Global proxy config (mutable via API)
+// Global proxy config (mutable via API, persisted to disk)
 var (
-	proxyConfig   = defaultProxyConfig()
+	proxyConfig   = loadProxyConfig()
 	proxyConfigMu sync.Mutex
 )
+
+func proxyConfigPath() string { return kit.ResolveDataPath(".proxy-config.json") }
+
+// loadProxyConfig 启动时从磁盘加载持久化配置；文件缺失或字段为空时回落到默认值。
+func loadProxyConfig() *proxyConfigData {
+	cfg := defaultProxyConfig()
+	if data, err := os.ReadFile(proxyConfigPath()); err == nil {
+		if err := json.Unmarshal(data, cfg); err != nil {
+			log.Printf("proxy config parse failed: %v", err)
+		}
+	}
+	if cfg.Strategy == "" {
+		cfg.Strategy = "round_robin"
+	}
+	if cfg.Headers == nil {
+		cfg.Headers = defaultProxyConfig().Headers
+	}
+	return cfg
+}
+
+// saveProxyConfigLocked 把当前配置落盘（调用方需已持有 proxyConfigMu）。
+func saveProxyConfigLocked() {
+	data, _ := json.MarshalIndent(proxyConfig, "", "  ")
+	if err := os.WriteFile(proxyConfigPath(), data, 0600); err != nil {
+		log.Printf("proxy config save failed: %v", err)
+	}
+}
 
 type proxyConfigData struct {
 	Strategy string            `json:"strategy"`
@@ -806,15 +834,15 @@ func defaultProxyConfig() *proxyConfigData {
 	return &proxyConfigData{
 		Strategy: "round_robin",
 		Headers: map[string]string{
-			"User-Agent":         "Cline/3.0.50",
+			"User-Agent":         "Cline/4.1.19",
 			"HTTP-Referer":       "https://cline.bot",
 			"X-Title":            "Cline",
 			"X-IS-MULTIROOT":     "false",
 			"X-CLIENT-TYPE":      "cline-cli",
-			"X-CLIENT-VERSION":   "3.0.50",
+			"X-CLIENT-VERSION":   "4.1.19",
 			"X-PLATFORM":         "terminal",
-			"X-PLATFORM-VERSION": "3.0.50",
-			"X-CORE-VERSION":     "0.0.70",
+			"X-PLATFORM-VERSION": "4.1.19",
+			"X-CORE-VERSION":     "0.0.83",
 		},
 	}
 }
@@ -829,6 +857,7 @@ func setProxyConfig(c *proxyConfigData) {
 	proxyConfigMu.Lock()
 	defer proxyConfigMu.Unlock()
 	proxyConfig = c
+	saveProxyConfigLocked()
 }
 
 // GET /admin/api/keys
