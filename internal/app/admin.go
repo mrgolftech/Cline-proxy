@@ -4,6 +4,7 @@ import (
 	"cline-go-proxy/internal/cline"
 	"cline-go-proxy/internal/kit"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,6 +56,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/accounts/proxy", corsHandler(handleAdminAccountProxy))
 	mux.HandleFunc("/admin/api/proxies/add", corsHandler(handleAdminProxyAdd))
 	mux.HandleFunc("/admin/api/proxies/delete", corsHandler(handleAdminProxyDelete))
+	mux.HandleFunc("/admin/api/proxies/test", corsHandler(handleAdminProxyTest))
 	mux.HandleFunc("/admin/api/model-proxies", corsHandler(handleAdminModelProxies))
 	mux.HandleFunc("/admin/api/oauth/start", corsHandler(handleOAuthStart))
 	mux.HandleFunc("/admin/api/oauth/status", corsHandler(handleOAuthStatus))
@@ -805,6 +807,62 @@ func handleAdminProxyDelete(w http.ResponseWriter, r *http.Request) {
 	setProxyConfig(cfg)
 	log.Printf("Proxy node %q deleted", name)
 	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "proxy deleted", Data: map[string]any{"proxies": cfg.Proxies, "modelProxies": cfg.ModelProxies}})
+}
+
+// POST /admin/api/proxies/test  body: { name }
+// 通过该节点出口请求 Cloudflare trace，返回出口 IP 与地区，用于连通性验证。
+func handleAdminProxyTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		writeAPI(w, http.StatusMethodNotAllowed, apiResponse{Error: "method not allowed"})
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: err.Error()})
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeAPI(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON"})
+		return
+	}
+	node, ok := poolNodeByName(strings.TrimSpace(req.Name))
+	if !ok {
+		writeAPI(w, http.StatusNotFound, apiResponse{Error: "proxy node not found"})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	probe, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.cloudflare.com/cdn-cgi/trace", nil)
+	resp, err := clineClientFor(node.URL).Do(probe)
+	if err != nil {
+		writeAPI(w, http.StatusOK, apiResponse{Success: false, Message: "connect failed",
+			Data: map[string]any{"ok": false, "error": err.Error()}})
+		return
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	ip, loc := parseTraceLine(string(b))
+	writeAPI(w, http.StatusOK, apiResponse{Success: true, Message: "ok",
+		Data: map[string]any{"ok": resp.StatusCode == http.StatusOK, "httpStatus": resp.StatusCode, "ip": ip, "loc": loc}})
+}
+
+func parseTraceLine(s string) (ip, loc string) {
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(line, "ip="):
+			ip = strings.TrimPrefix(line, "ip=")
+		case strings.HasPrefix(line, "loc="):
+			loc = strings.TrimPrefix(line, "loc=")
+		}
+	}
+	return
 }
 
 // POST /admin/api/model-proxies  body: { model, nodes:[节点名] }  nodes 为空 => 删除该模型规则

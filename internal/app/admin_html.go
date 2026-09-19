@@ -138,6 +138,17 @@ select{cursor:pointer;appearance:none;background-image:linear-gradient(45deg,tra
 .inline-flex{display:inline-flex;align-items:center;gap:6px}
 .justify-between{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
 .hint{font-size:12px;color:var(--text2);margin-top:8px;line-height:1.6}
+.ms{position:relative;display:inline-block;min-width:190px;max-width:320px;vertical-align:middle}
+.ms-btn{width:100%;text-align:left;padding:7px 26px 7px 11px;font-size:12.5px;border:1px solid var(--border);border-radius:var(--radius-sm);background:rgba(2,6,23,.4);color:var(--text);cursor:pointer;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;position:relative;font-family:inherit}
+[data-theme="light"] .ms-btn{background:rgba(15,23,42,.03)}
+.ms-btn::after{content:'▾';position:absolute;right:10px;opacity:.6}
+.ms-panel{position:absolute;z-index:60;top:100%;left:0;margin-top:4px;min-width:100%;max-height:260px;overflow:auto;background:var(--bg2);border:1px solid var(--border-strong);border-radius:var(--radius-sm);box-shadow:0 10px 30px rgba(2,6,23,.45);padding:6px;display:none}
+.ms-panel.open{display:block}
+.ms-item{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12.5px;white-space:nowrap;color:var(--text)}
+.ms-item:hover{background:rgba(148,163,184,.12)}
+.ms-item input{width:auto;padding:0;margin:0;cursor:pointer;accent-color:var(--accent)}
+.ms-item .ms-ord{margin-left:auto;font-size:10px;color:var(--accent);font-weight:600}
+.ms-empty{padding:8px;font-size:12px;color:var(--text3)}
 .hint strong{color:var(--text)}
 
 /* ===== Toast ===== */
@@ -442,7 +453,7 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
   <div class="section-body">
     <div class="table-wrap">
     <table>
-      <thead><tr><th style="width:200px">名称</th><th>URL</th><th style="width:60px">操作</th></tr></thead>
+      <thead><tr><th style="width:200px">名称</th><th>URL</th><th style="width:150px">操作</th></tr></thead>
       <tbody id="proxyPoolBody"><tr><td colspan="3" class="empty">加载中...</td></tr></tbody>
     </table>
     </div>
@@ -466,7 +477,9 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     </div>
     <div class="form-row" style="margin-top:12px">
       <div class="field"><label>模型</label><input type="text" id="mpModel" placeholder="cline-free/muse-spark-1.3-contributor"></div>
-      <div class="field"><label>出口名称</label><input type="text" id="mpNodes" placeholder="UK-42015,DE-42022"></div>
+      <div class="field"><label>出口节点（多选，顺序=尝试顺序）</label>
+        <div class="ms" id="mpNodesMs" data-ms data-value=""><button type="button" class="ms-btn" onclick="msToggle(event,this)"></button><div class="ms-panel" onclick="event.stopPropagation()"></div></div>
+      </div>
       <div class="field" style="justify-content:flex-end"><button class="btn btn-primary" onclick="saveModelProxy()">💾 保存规则</button></div>
     </div>
     <div class="hint">为某模型限定出口后，只有列出的节点会被使用；账号未绑定这些节点时，直接使用规则里的节点。</div>
@@ -591,6 +604,7 @@ async function loadStats() {
 
 // ========== 账号管理 ==========
 async function loadAccounts() {
+  await ensurePoolNodes();
   try {
     const d = await api('GET', '/accounts');
     const list = d.data.accounts;
@@ -613,7 +627,7 @@ async function loadAccounts() {
         '<td>' + esc(a.email) + '</td>' +
         '<td><span class="status ' + a.status + '"><span class="status-dot ' + a.status + '"></span>' + (sn[a.status] || a.status) + '</span>' + statusExtra + '</td>' +
           '<td title="今日 ' + fmtNum(a.tokensToday) + ' / 累计 ' + fmtNum(a.tokensTotal) + ' tokens（上游返回 usage 时精确，否则为估算值）">' + fmtTokens(a.tokensToday) + ' / ' + fmtTokens(a.tokensTotal) + '</td>' +
-        '<td style="white-space:nowrap"><input class="acct-proxy" data-id="' + a.accountId + '" value="' + esc((a.proxies || []).join(', ')) + '" placeholder="节点名,逗号分隔" style="width:170px;font-size:11px;padding:4px 6px;border-radius:6px;border:1px solid var(--border);background:transparent;color:var(--text)"> <button class="btn btn-sm" onclick="setAccountProxy(\'' + a.accountId + '\', this)" title="保存出口节点（有序，空=直连）">💾</button></td>' +
+        '<td style="white-space:nowrap"><div class="ms" data-ms data-value="' + esc((a.proxies || []).join(',')) + '"><button type="button" class="ms-btn" onclick="msToggle(event,this)"></button><div class="ms-panel" onclick="event.stopPropagation()"></div></div> <button class="btn btn-sm" onclick="saveAccountProxies(\'' + a.accountId + '\', this)" title="保存出口节点（有序，空=直连）">💾</button></td>' +
         '<td class="mono" style="font-size:11px">' + lu + '</td>' +
         '<td class="mono" style="font-size:11px">' + cr + '</td>' +
         '<td style="white-space:nowrap">' +
@@ -622,21 +636,69 @@ async function loadAccounts() {
           '<button class="btn btn-sm btn-danger" onclick="deleteAccount(\'' + a.accountId + '\')" title="删除">✕</button>' +
         '</td></tr>';
     }).join('');
+    document.querySelectorAll('#accountTableBody .ms').forEach(ms => msUpdateLabel(ms));
   } catch (e) { toast('加载账号失败: ' + e.message, 'error'); }
 }
+
+// ========== 通用多选下拉（出口节点） ==========
+let POOL_NODES = [];
+async function ensurePoolNodes() {
+  if (POOL_NODES.length) return POOL_NODES;
+  try { const d = await api('GET', '/config'); POOL_NODES = (d.data && d.data.proxies) || []; } catch (e) { POOL_NODES = []; }
+  return POOL_NODES;
+}
+function msValue(ms) { return (ms.dataset.value || '').split(',').map(s => s.trim()).filter(Boolean); }
+function msUpdateLabel(ms) {
+  const sel = msValue(ms);
+  const btn = ms.querySelector('.ms-btn');
+  btn.textContent = sel.length ? sel.join(', ') : '直连';
+  btn.title = sel.length ? sel.join(' → ') : '未选择 = 直连';
+}
+function msRenderPanel(ms) {
+  const sel = msValue(ms);
+  const panel = ms.querySelector('.ms-panel');
+  if (!POOL_NODES.length) { panel.innerHTML = '<div class="ms-empty">代理池为空，请先在「代理池」页添加节点</div>'; return; }
+  panel.innerHTML = POOL_NODES.map(p => {
+    const idx = sel.indexOf(p.name);
+    return '<label class="ms-item"><input type="checkbox" ' + (idx >= 0 ? 'checked' : '') + ' onchange="msToggleItem(this)">' +
+      '<span>' + esc(p.name) + '</span><span class="ms-ord">' + (idx >= 0 ? (idx + 1) : '') + '</span></label>';
+  }).join('');
+}
+function msToggle(ev, btn) {
+  ev.stopPropagation();
+  const ms = btn.closest('.ms');
+  const panel = ms.querySelector('.ms-panel');
+  const wasOpen = panel.classList.contains('open');
+  document.querySelectorAll('.ms-panel.open').forEach(p => p.classList.remove('open'));
+  if (!wasOpen) { msRenderPanel(ms); panel.classList.add('open'); }
+}
+function msToggleItem(cb) {
+  const ms = cb.closest('.ms');
+  const name = cb.parentElement.querySelector('span').textContent;
+  let sel = msValue(ms);
+  if (cb.checked) { if (!sel.includes(name)) sel.push(name); }
+  else { sel = sel.filter(x => x !== name); }
+  ms.dataset.value = sel.join(',');
+  msUpdateLabel(ms);
+  msRenderPanel(ms);
+}
+function msSetValue(ms, arr) { ms.dataset.value = (arr || []).join(','); msUpdateLabel(ms); msRenderPanel(ms); }
+document.addEventListener('click', () => document.querySelectorAll('.ms-panel.open').forEach(p => p.classList.remove('open')));
 
 // ========== 代理池 ==========
 async function loadProxyPool() {
   try {
     const d = await api('GET', '/config');
     const proxies = (d.data && d.data.proxies) || [];
+    POOL_NODES = proxies;
     const mp = (d.data && d.data.modelProxies) || {};
     const tb = _('proxyPoolBody');
     if (!tb) return;
     tb.innerHTML = proxies.length ? proxies.map(p =>
       '<tr><td>' + esc(p.name) + '</td>' +
       '<td class="mono" style="font-size:11px">' + esc(p.url) + '</td>' +
-      '<td><button class="btn btn-sm btn-danger" onclick="deleteProxyNode(\'' + esc(p.name) + '\')" title="删除">✕</button></td></tr>'
+      '<td style="white-space:nowrap"><button class="btn btn-sm" onclick="testProxyNode(\'' + esc(p.name) + '\', this)" title="测试连通性（返回出口 IP/地区）">⚡ 测试</button> ' +
+      '<button class="btn btn-sm btn-danger" onclick="deleteProxyNode(\'' + esc(p.name) + '\')" title="删除">✕</button></td></tr>'
     ).join('') : '<tr><td colspan="3" class="empty">暂无节点，请在下方添加</td></tr>';
 
     const mb = _('modelProxyBody');
@@ -658,29 +720,43 @@ async function addProxyNode() {
     await api('POST', '/proxies/add', { name, url });
     toast('节点已保存', 'success');
     _('pnName').value = ''; _('pnUrl').value = '';
+    POOL_NODES = [];
     loadProxyPool();
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 
 async function deleteProxyNode(name) {
   if (!confirm('删除节点 ' + name + ' ？引用它的账号/规则将失效。')) return;
-  try { await api('POST', '/proxies/delete', { name }); toast('已删除', 'success'); loadProxyPool(); }
+  try { await api('POST', '/proxies/delete', { name }); toast('已删除', 'success'); POOL_NODES = []; loadProxyPool(); }
   catch (e) { toast('删除失败: ' + e.message, 'error'); }
+}
+
+async function testProxyNode(name, btn) {
+  const orig = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="loading"></span>'; }
+  try {
+    const d = await api('POST', '/proxies/test', { name });
+    const r = d.data || {};
+    if (r.ok) toast('节点 ' + name + ' 可用\n出口 IP: ' + (r.ip || '?') + '   地区: ' + (r.loc || '?'), 'success', 6000);
+    else toast('节点 ' + name + ' 不可用\n' + (r.error || ('HTTP ' + (r.httpStatus || '?'))), 'error', 7000);
+  } catch (e) { toast('测试失败: ' + e.message, 'error'); }
+  finally { if (btn) { btn.disabled = false; btn.innerHTML = orig; } }
 }
 
 async function saveModelProxy() {
   const model = _('mpModel').value.trim();
-  const nodes = _('mpNodes').value.split(',').map(s => s.trim()).filter(Boolean);
+  const nodes = msValue(_('mpNodesMs'));
   if (!model) { toast('模型必填', 'error'); return; }
-  try { await api('POST', '/model-proxies', { model, nodes }); toast('规则已保存', 'success'); _('mpModel').value = ''; _('mpNodes').value = ''; loadProxyPool(); }
+  try { await api('POST', '/model-proxies', { model, nodes }); toast('规则已保存', 'success'); _('mpModel').value = ''; msSetValue(_('mpNodesMs'), []); loadProxyPool(); }
   catch (e) { toast('保存失败: ' + e.message, 'error'); }
 }
 
 async function editModelProxy(k) {
   _('mpModel').value = k;
+  await ensurePoolNodes();
   try {
     const d = await api('GET', '/config');
-    _('mpNodes').value = (((d.data || {}).modelProxies || {})[k] || []).join(', ');
+    msSetValue(_('mpNodesMs'), (((d.data || {}).modelProxies || {})[k] || []));
   } catch (e) { /* ignore */ }
 }
 
@@ -690,9 +766,9 @@ async function deleteModelProxy(k) {
   catch (e) { toast('删除失败: ' + e.message, 'error'); }
 }
 
-async function setAccountProxy(id, btn) {
-  const input = document.querySelector('input.acct-proxy[data-id="' + id + '"]');
-  const proxies = input ? input.value.split(',').map(s => s.trim()).filter(Boolean) : [];
+async function saveAccountProxies(id, btn) {
+  const ms = btn.closest('tr').querySelector('.ms');
+  const proxies = msValue(ms);
   if (btn) { btn.disabled = true; }
   try {
     await api('POST', '/accounts/proxy', { accountId: id, proxies });
