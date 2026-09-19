@@ -68,10 +68,7 @@ func StartProxy(host string, port int) error {
 	freePort(port)
 
 	startModelsRefresher()
-	startZenModelsRefresher()
-	initStats()
 	LoadRequestLogsFromFile()
-	go cleanupCompactStates()
 
 	mux := http.NewServeMux()
 
@@ -199,17 +196,6 @@ func StartProxy(host string, port int) error {
 
 		// Override system prompt from override.md for OpenAI format
 		applyOverride(params)
-
-		// zen 免费模型路由
-		if route := routeModel(model); route == "zen" {
-			handleZenChat(w, r, params)
-			return
-		} else if route == "reject" {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", model), "type": "invalid_request_error"},
-			})
-			return
-		}
 
 		upstreamStream := isStream
 		if !isStream {
@@ -356,74 +342,6 @@ func applyOverride(params map[string]any) {
 	}
 }
 
-// handleZenChat opencode zen 免费模型分支: 压缩 -> 上游 -> 透传,并记录统计
-func handleZenChat(w http.ResponseWriter, r *http.Request, params map[string]any) {
-	cfg := getZenConfig()
-	if !cfg.Enabled {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]string{"message": "zen upstream disabled in /admin/ settings", "type": "api_error"},
-		})
-		return
-	}
-	zm, ok := resolveZenFreeModel(model)
-	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": fmt.Sprintf("model %q is not a free zen model", model), "type": "invalid_request_error"},
-		})
-		return
-	}
-	isStream, _ := params["stream"].(bool)
-	tracker := newZenStatsTracker(zenStatsRecord{
-		TS:           time.Now().UnixMilli(),
-		Upstream:     "zen",
-		Model:        zm.ID,
-		Stream:       isStream,
-		PromptTokens: estimateJSON(params),
-	})
-
-	sid := requestSessionID(params, r.Header)
-	out := maybeCompact(params, zm, sid)
-	tracker.rec.Compacted = out.changed
-	tracker.rec.CompactionTokens = out.compactTokens
-	if out.changed {
-		log.Printf("  zen: %s", out.note)
-	}
-
-	resp, rateLimited, err := callZenAPI(params, isStream)
-	if err != nil {
-		log.Printf("  zen api error: %v", err)
-		tracker.rec.RateLimited = rateLimited
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
-		tracker.finish(false, http.StatusBadGateway)
-		return
-	}
-	tracker.rec.RateLimited = rateLimited
-	defer resp.Body.Close()
-	tracker.rec.Status = resp.StatusCode
-
-	usageFn := func(u map[string]any) {
-		if pt, ok := u["prompt_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens += int(pt) - tracker.rec.PromptTokens
-			if tracker.rec.CompletionTokens < 0 {
-				tracker.rec.CompletionTokens = 0
-			}
-		}
-		if ct, ok := u["completion_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens = int(ct)
-		}
-	}
-
-	if isStream {
-		handleStreamResponseWithUsage(w, resp, usageFn)
-		tracker.finish(true, resp.StatusCode)
-		return
-	}
-	handleNonStreamResponseWithUsage(w, resp, usageFn)
-	tracker.finish(true, resp.StatusCode)
-}
-
 func cleanMessages(messages []any) []any {
 	cleaned := make([]any, 0, len(messages))
 	for _, m := range messages {
@@ -523,7 +441,6 @@ func callClineAPI(params map[string]any, stream bool) (*http.Response, *Account,
 		return nil, nil, fmt.Errorf("no active accounts available: %s", describePoolStatus())
 	}
 
-	model, _ := params["model"].(string)
 
 	tried := make(map[string]struct{}, attempts)
 	var lastErr error
@@ -1460,17 +1377,6 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("  anthropic: model=%s stream=%v msgs=%d", req.Model, req.Stream, len(req.Messages))
 
-	// zen 免费模型路由
-	if route := routeModel(req.Model); route == "zen" {
-		handleZenAnthropic(w, r, req, openAIReq, toolSchemas)
-		return
-	} else if route == "reject" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": fmt.Sprintf("model %q is a paid zen model; only free zen models are proxied", req.Model), "type": "invalid_request_error"},
-		})
-		return
-	}
-
 	activeCount := 0
 	p := loadPool()
 	for _, a := range p.Accounts {
@@ -1556,91 +1462,6 @@ func handleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, anthropicResp)
-}
-
-// handleZenAnthropic Anthropic Messages 请求路由到 zen 免费模型上游
-func handleZenAnthropic(w http.ResponseWriter, r *http.Request, req anthropicReq, openAIReq map[string]any, toolSchemas map[string]map[string]bool) {
-	cfg := getZenConfig()
-	if !cfg.Enabled {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
-			"error": map[string]string{"message": "zen upstream disabled in /admin/ settings", "type": "api_error"},
-		})
-		return
-	}
-	zm, ok := resolveZenFreeModel(req.Model)
-	if !ok {
-		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"error": map[string]string{"message": fmt.Sprintf("model %q is not a free zen model", req.Model), "type": "invalid_request_error"},
-		})
-		return
-	}
-	isStream := req.Stream
-	tracker := newZenStatsTracker(zenStatsRecord{
-		TS:           time.Now().UnixMilli(),
-		Upstream:     "zen",
-		Model:        zm.ID,
-		Stream:       isStream,
-		PromptTokens: estimateJSON(openAIReq),
-	})
-
-	sid := requestSessionID(openAIReq, r.Header)
-	out := maybeCompact(openAIReq, zm, sid)
-	tracker.rec.Compacted = out.changed
-	tracker.rec.CompactionTokens = out.compactTokens
-	if out.changed {
-		log.Printf("  anthropic zen: %s", out.note)
-	}
-
-	resp, rateLimited, err := callZenAPI(openAIReq, isStream)
-	if err != nil {
-		log.Printf("  anthropic zen api error: %v", err)
-		tracker.rec.RateLimited = rateLimited
-		writeJSON(w, http.StatusBadGateway, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "api_error"},
-		})
-		tracker.finish(false, http.StatusBadGateway)
-		return
-	}
-	tracker.rec.RateLimited = rateLimited
-	defer resp.Body.Close()
-	tracker.rec.Status = resp.StatusCode
-
-	usageFn := func(u map[string]any) {
-		if ct, ok := u["completion_tokens"].(float64); ok {
-			tracker.rec.CompletionTokens = int(ct)
-		}
-	}
-
-	if isStream {
-		handleAnthropicStreamWithUsage(w, resp, zm.ID, toolSchemas, usageFn)
-		tracker.finish(true, resp.StatusCode)
-		return
-	}
-
-	var raw map[string]any
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": map[string]string{"message": err.Error(), "type": "parse_error"},
-		})
-		tracker.finish(false, http.StatusInternalServerError)
-		return
-	}
-	if u, ok := raw["usage"].(map[string]any); ok && len(u) > 0 {
-		usageFn(u)
-	}
-	chatOut := raw
-	if data, ok := raw["data"]; ok {
-		if d, ok := data.(map[string]any); ok {
-			chatOut = d
-		}
-	}
-	chatOut = normalizeOpenAIResponse(chatOut)
-	anthropicResp := openAIToAnthropic(chatOut)
-	if tc, ok := getNested(chatOut, "choices", 0, "message", "tool_calls").([]any); ok && len(tc) > 0 {
-		anthropicResp["stop_reason"] = "tool_use"
-	}
-	writeJSON(w, http.StatusOK, anthropicResp)
-	tracker.finish(true, resp.StatusCode)
 }
 
 func handleAnthropicStreamWithUsage(w http.ResponseWriter, upstream *http.Response, modelName string, toolSchemas map[string]map[string]bool, onUsage func(map[string]any)) {
