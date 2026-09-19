@@ -3,7 +3,6 @@ module cline-go-proxy
 go 1.25.0
 
 require (
-	github.com/refraction-networking/utls v1.8.2
 	golang.org/x/net v0.57.0
 )
 
