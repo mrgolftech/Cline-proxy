@@ -9,12 +9,34 @@ import (
 )
 
 func isLoopbackRequest(r *http.Request) bool {
+	ip := requestClientIP(r)
+	return ip != nil && ip.IsLoopback()
+}
+
+func requestClientIP(r *http.Request) net.IP {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
 	}
-	ip := net.ParseIP(strings.TrimSpace(host))
-	return ip != nil && ip.IsLoopback()
+	peer := net.ParseIP(strings.TrimSpace(host))
+	if peer == nil || !peer.IsLoopback() {
+		return peer
+	}
+
+	// Only trust forwarding headers when the direct peer is loopback.
+	// This covers local Nginx/NPM without allowing remote clients to spoof XFF.
+	if xff := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); xff != "" {
+		first := strings.TrimSpace(strings.Split(xff, ",")[0])
+		if ip := net.ParseIP(first); ip != nil {
+			return ip
+		}
+	}
+	if xrip := strings.TrimSpace(r.Header.Get("X-Real-IP")); xrip != "" {
+		if ip := net.ParseIP(xrip); ip != nil {
+			return ip
+		}
+	}
+	return peer
 }
 
 func securityMiddleware(next http.Handler) http.Handler {
