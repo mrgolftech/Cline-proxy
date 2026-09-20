@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -19,7 +20,15 @@ import (
 //	setClineClientIdentity({ name, version, platform: "cli", platformVersion: version })
 //
 // 头名/默认值定义：sdk/packages/llms/src/providers/request-headers.ts
-const clineRawBase = "https://raw.githubusercontent.com/cline/cline/main"
+// var 而非 const：单元测试要把它指向 httptest 服务器，避免测试依赖外网。
+var clineRawBase = "https://raw.githubusercontent.com/cline/cline/main"
+
+// officialVersionURL 拼接官方 raw 文件地址。**必须补斜杠**：
+// clineRawBase 结尾没有 "/"，直接拼 "apps/cli/package.json" 会得到
+// ".../mainapps/cli/package.json" → GitHub 返回 404（踩过）。
+func officialVersionURL(path string) string {
+	return clineRawBase + "/" + strings.TrimPrefix(path, "/")
+}
 
 // headerSyncResult 同步结果（返回给后台，便于展示「从什么变成了什么」）。
 type headerSyncResult struct {
@@ -32,7 +41,7 @@ type headerSyncResult struct {
 
 func fetchOfficialVersion(path string) (string, error) {
 	client := &http.Client{Timeout: 20 * time.Second}
-	resp, err := client.Get(clineRawBase + path)
+	resp, err := client.Get(officialVersionURL(path))
 	if err != nil {
 		return "", fmt.Errorf("拉取 %s 失败: %w", path, err)
 	}
