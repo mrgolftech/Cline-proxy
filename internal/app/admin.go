@@ -75,6 +75,7 @@ func registerAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/api/models/refresh", corsHandler(handleAdminModelsRefresh))
 	mux.HandleFunc("/admin/api/config", corsHandler(handleAdminConfig))
 	mux.HandleFunc("/admin/api/config/update", corsHandler(handleAdminUpdateConfig))
+	mux.HandleFunc("/admin/api/headers/sync", corsHandler(handleAdminSyncHeaders))
 }
 
 func adminStaticHandler(w http.ResponseWriter, r *http.Request) {
@@ -1060,14 +1061,14 @@ func defaultProxyConfig() *proxyConfigData {
 	return &proxyConfigData{
 		Strategy: "round_robin",
 		Headers: map[string]string{
-			"User-Agent":         "Cline/4.1.19",
+			"User-Agent":         "Cline/3.0.62",
 			"HTTP-Referer":       "https://cline.bot",
 			"X-Title":            "Cline",
 			"X-IS-MULTIROOT":     "false",
 			"X-CLIENT-TYPE":      "cline-cli",
-			"X-CLIENT-VERSION":   "4.1.19",
-			"X-PLATFORM":         "terminal",
-			"X-PLATFORM-VERSION": "4.1.19",
+			"X-CLIENT-VERSION":   "3.0.62",
+			"X-PLATFORM":         "cli",
+			"X-PLATFORM-VERSION": "3.0.62",
 			"X-CORE-VERSION":     "0.0.83",
 		},
 		Proxies: []ProxyNode{},

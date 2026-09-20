@@ -402,8 +402,9 @@ body:not([data-theme="dark"]) .theme-toggle .dark-label{display:none}
     <div class="form-actions">
       <button class="btn btn-sm" onclick="addHeaderRow()">➕ 添加请求头</button>
       <button class="btn btn-sm btn-primary" onclick="saveHeaders()">💾 保存请求头</button>
+      <button class="btn btn-sm" onclick="syncOfficialHeaders()">🔄 同步官方版本</button>
     </div>
-    <div class="hint">这些请求头会附加到所有转发给 Cline API 的请求中，以模拟官方客户端行为。</div>
+    <div class="hint">这些请求头会附加到所有转发给 Cline API 的请求中，以模拟官方客户端行为。「🔄 同步官方版本」会拉取 Cline 官方 CLI 版本（apps/cli）与 core 版本并自动填好，无需手改。</div>
     <div id="headerSaveResult" style="margin-top:8px"></div>
   </div>
 </div>
@@ -1035,6 +1036,23 @@ async function saveHeaders() {
     setTimeout(() => _('headerSaveResult').innerHTML = '', 5000);
     loadConfig();
   } catch (e) { toast('保存失败: ' + e.message, 'error'); }
+}
+
+// 拉取官方 Cline CLI/core 版本并自动更新请求头（版本号跟着官方走，头名不变）。
+async function syncOfficialHeaders() {
+  const box = _('headerSaveResult');
+  box.innerHTML = '<div style="color:var(--text3);font-size:12px">正在拉取官方版本…</div>';
+  try {
+    const d = await api('POST', '/headers/sync');
+    const x = d.data || {};
+    box.innerHTML = '<div style="color:' + (x.changed ? 'var(--accent2)' : 'var(--text3)') + ';font-size:12px">' +
+      (x.changed ? '✓ ' : '· ') + esc(d.message || '') + '</div>';
+    toast(d.message || '已同步', x.changed ? 'success' : 'info');
+    loadConfig();
+  } catch (e) {
+    box.innerHTML = '<div style="color:var(--danger);font-size:12px">✕ 同步失败：' + esc(e.message) + '</div>';
+    toast('同步失败: ' + e.message, 'error');
+  }
 }
 
 const MODEL_STYLE = {
