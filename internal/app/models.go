@@ -4,6 +4,7 @@ import (
 	"cline-go-proxy/internal/cline"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -35,7 +36,14 @@ var (
 	modelsCache    map[string]*ModelInfo
 	modelsSyncing  bool
 	modelsLastSync time.Time
+	// modelProbed records the last liveness probe per model id. A cached model that
+	// dropped out of the official feed is probed; if upstream says "not found" it is
+	// marked ModelRemoved so it stops being advertised. Re-probed every
+	// modelProbeInterval so a model that comes back is noticed.
+	modelProbed = map[string]time.Time{}
 )
+
+const modelProbeInterval = 6 * time.Hour
 
 const (
 	modelsRefreshInterval = 60 * time.Second
@@ -129,11 +137,12 @@ func syncRecommendedModels() (int, error) {
 	}
 
 	modelsMu.Lock()
-	defer modelsMu.Unlock()
 
 	added := 0
+	inFeed := make(map[string]bool, len(payload.Free))
 	for _, m := range payload.Free {
 		id := m.ID
+		inFeed[id] = true
 		provider := id
 		if i := indexByte(id, '/'); i >= 0 {
 			provider = id[:i]
@@ -162,8 +171,87 @@ func syncRecommendedModels() (int, error) {
 		added++
 	}
 
+	// A cached model that is no longer in the official feed may be retired upstream.
+	// Collect the ones due for a probe; the actual network probe runs outside the
+	// lock (see reconcileStaleModels) so a slow upstream never blocks /v1/models.
+	stale := make([]string, 0)
+	now := time.Now()
+	for id, m := range modelsCache {
+		if inFeed[id] || m.Status == ModelRemoved {
+			continue
+		}
+		if last, ok := modelProbed[id]; ok && now.Sub(last) < modelProbeInterval {
+			continue
+		}
+		stale = append(stale, id)
+	}
+	modelsMu.Unlock()
+
+	if len(stale) > 0 {
+		go reconcileStaleModels(stale)
+	}
+
+	modelsMu.Lock()
 	modelsLastSync = time.Now()
 	return added, nil
+}
+
+// reconcileStaleModels probes cached-but-unlisted models and marks the ones upstream
+// answers "not found" for as ModelRemoved. Anything still answering stays listed —
+// some free models work after being delisted from the feed (e.g. z-ai/glm-5.3-flash).
+func reconcileStaleModels(ids []string) {
+	for _, id := range ids {
+		removed := probeModelGone(id)
+		modelsMu.Lock()
+		modelProbed[id] = time.Now()
+		if removed {
+			if m, ok := modelsCache[id]; ok && m.Status == ModelActive {
+				m.Status = ModelRemoved
+				log.Printf("  model probe: %q no longer available upstream, marked removed", id)
+			}
+		} else if m, ok := modelsCache[id]; ok && m.Status == ModelRemoved {
+			m.Status = ModelActive
+			log.Printf("  model probe: %q is available again, reactivated", id)
+		}
+		modelsMu.Unlock()
+	}
+}
+
+// probeModelGone issues one minimal upstream chat call and reports whether the model
+// is gone (HTTP 404 / "model not found"). Any other outcome — 200, 429, 5xx, network
+// error — is treated as "still there" so the probe itself can never retire a model on
+// a transient failure.
+func probeModelGone(id string) bool {
+	acc := pickAccount()
+	if acc == nil {
+		return false
+	}
+	token, err := ensureAccountToken(acc)
+	if err != nil {
+		return false
+	}
+	body := []byte(fmt.Sprintf(
+		`{"model":%q,"messages":[{"role":"user","content":"ping"}],"max_tokens":1,"stream":false}`, id))
+	req, err := http.NewRequest("POST", clineAPIBaseURL+"/chat/completions", strings.NewReader(string(body)))
+	if err != nil {
+		return false
+	}
+	req.Header = clineHeaders(token, "sess_probe")
+	client := &http.Client{Timeout: modelsSyncTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return true
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		return false
+	}
+	// Non-404 errors: peek at the body for an explicit "not found".
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+	return strings.Contains(strings.ToLower(string(b)), "model not found")
 }
 
 func indexByte(s string, b byte) int {
@@ -225,18 +313,25 @@ func normalizeRequestModel(id string) string {
 	}
 	initModelsCache()
 	modelsMu.Lock()
-	_, ok := modelsCache[id]
+	m, ok := modelsCache[id]
 	modelsMu.Unlock()
-	if ok {
+	if ok && m.Status != ModelRemoved {
 		return id
 	}
-	log.Printf("  model %q not in free list, fallback to %q", id, getDefaultModel())
+	if ok {
+		log.Printf("  model %q is marked removed, fallback to %q", id, getDefaultModel())
+	} else {
+		log.Printf("  model %q not in free list, fallback to %q", id, getDefaultModel())
+	}
 	return getDefaultModel()
 }
 
 func apiModelList() []map[string]any {
 	out := make([]map[string]any, 0, len(modelsCache))
 	for _, m := range getFreeModels() {
+		if m.Status == ModelRemoved {
+			continue // retired upstream: don't advertise
+		}
 		out = append(out, map[string]any{
 			"id":         m.ID,
 			"object":     "model",
