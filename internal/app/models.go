@@ -193,6 +193,7 @@ func syncRecommendedModels() (int, error) {
 
 	modelsMu.Lock()
 	modelsLastSync = time.Now()
+	modelsMu.Unlock()
 	return added, nil
 }
 
